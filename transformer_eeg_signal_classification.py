@@ -168,6 +168,7 @@ if opt.pretrained_itsa != '':
     itsa.adapt_from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
 else:
     itsa = ITSAIntegrator.from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
+    torch.save(itsa, 'itsa_pretrained_space_subject%d.pth' % (opt.subject))
 
 # Load model
 model_options = {key: int(value) if value.isdigit() else (float(value) if value[0].isdigit() else value) for
@@ -249,7 +250,7 @@ for epoch in range(1, opt.epochs + 1):
                 target = target.to("cuda")
                 batch_subjects = batch_subjects.to("cuda")
             # Forward
-            input = itsa.transform_bath(input, batch_subjects)
+            input = itsa.transform_batch(input, batch_subjects)
             output = model(input)
 
             # Compute loss
@@ -299,6 +300,4 @@ for epoch in range(1, opt.epochs + 1):
 
     if epoch % opt.saveCheck == 0:
         torch.save(model, '%s__subject%d_epoch_%d.pth' % (opt.model_type, opt.subject, epoch))
-
-        torch.save(itsa, 'itsa_pretrained_space.pth')
-        print(f"Modelo y espacio ITSA guardados en la época {epoch}.")
+        print(f"Modelo guardado en la época {epoch}.")

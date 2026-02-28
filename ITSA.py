@@ -494,7 +494,7 @@ class ITSAIntegrator:
                 else:
                     eeg2d = eeg
 
-                C = cov_from_signal_torch(eeg2d).cpu().numpy()  # (C,C) SPD
+                C = cov_from_signal_torch(eeg2d.double(), eps=1e-4).cpu().numpy()  # (C,C) SPD
                 covs_list.append(C)
 
                 labels_list.append(int(dataset.data[i]["label"]))
