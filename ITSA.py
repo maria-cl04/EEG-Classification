@@ -268,11 +268,8 @@ class ITSA:
             W_s = invsqrtm(Cbar_rec_s) @ sqrtm(G_target_s)
             self.A_filters_[s] = self.M_inv_sqrt_[s] @ W_s
 
-        self._filters_cache.clear()  # Limpiamos caché GPU
-
-        # ITSA.py, al final de adapt_subject:
-        self.Rs_.clear()  # ya no necesitamos R una vez derivado A_s
-        self._filters_cache.clear()  # fuerza recacheo en device/dtype correctos
+        self.Rs_.clear()  # Ya no necesitamos R una vez derivado A_s
+        self._filters_cache.clear()  # Fuerza recacheo en device/dtype correctos
 
         return self
 
@@ -306,32 +303,6 @@ class ITSA:
         self._filters_cache.clear()
         return self
 
-    def transform(
-        self,
-        covs: Union[np.ndarray, torch.Tensor],
-        subjects: Union[np.ndarray, torch.Tensor],
-    ) -> np.ndarray:
-        """
-        Devuelve características ITSA (TS estandarizado y rotado).
-        Acepta covs/subjects en NumPy o Torch, y retorna NumPy (para coherencia con TS/Sklearn).
-        """
-        assert self.ts_ is not None and self.scaler_ is not None
-
-        covs_np = _as_numpy(covs)
-        subjects_np = _as_numpy(subjects).astype(np.int64).reshape(-1)
-
-        # Recentrado por sujeto en NumPy (robusto y coherente con fit)
-        covs_rec = self._apply_subject_recentering_np(covs_np, subjects_np)
-
-        # TS -> estandarización -> rotación por sujeto
-        Z = self.ts_.transform(covs_rec)
-        Z_std = self.scaler_.transform(Z)
-        Z_rot = Z_std.copy()
-        for s, R in self.Rs_.items():
-            m = (subjects_np == s)
-            if np.any(m):
-                Z_rot[m] = Z_rot[m] @ R
-        return Z_rot
 
     # --------------------- API de señales ------------------------------------
     def _derive_subject_filters(
@@ -421,7 +392,7 @@ class ITSA:
         elif subjects.dim() == 0:
             subjects = subjects.view(1)
 
-        # Helper NATIVO de PyTorch: 100% en la GPU y ultra rápido
+        # Helper NATIVO de PyTorch: 100% en la GPU y ultrarápido
         def _blend_filter_torch(A_t: torch.Tensor, alpha: float) -> torch.Tensor:
             w, V = torch.linalg.eigh(A_t)
             w = torch.clamp(w, min=1e-8)
@@ -487,8 +458,6 @@ class ITSA:
         return lite
 
 # ------------------------------ Integrador minimalista ------------------------------
-import torch as _torch  # alias local para evitar sombra de nombre
-
 class ITSAIntegrator:
     """
     Capa de integración para usar ITSA con cambios mínimos en el script principal.
@@ -590,10 +559,10 @@ class ITSAIntegrator:
         self._itsa.adapt_subject(covs=covs, labels=labels, subjects=subjects, train_idx=train_idx)
         return self
 
-    @_torch.no_grad()
-    def transform_batch(self, x: _torch.Tensor, subjects: _torch.Tensor,
+    @torch.no_grad()
+    def transform_batch(self, x: torch.Tensor, subjects: torch.Tensor,
                         mode: str = "deterministic",
-                        alpha_range=(1.0, 1.0)) -> _torch.Tensor:
+                        alpha_range=(1.0, 1.0)) -> torch.Tensor:
         """
         Aplica ITSA por sujeto. Conserva la forma de x:
         - (B,T,C) -> (B,T,C)
