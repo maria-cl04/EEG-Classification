@@ -395,8 +395,7 @@ class ITSA:
             x: torch.Tensor,
             subjects: torch.Tensor,
             mode: str = "deterministic",  # "augment" | "deterministic"
-            alpha_range=(1.0, 1.0),  # si augment: mezcla I↔A_s, p.ej. (0.5, 0.95)
-            jitter_sigma: float = 0.0  # jitter SPD opcional, p.ej. 0.01–0.02
+            alpha_range=(1.0, 1.0)  # si augment: mezcla I↔A_s, p.ej. (0.5, 0.95)
     ) -> torch.Tensor:
         """
         Aplica el filtro espacial por sujeto y devuelve la MISMA forma que x.
@@ -429,7 +428,7 @@ class ITSA:
         elif subjects.dim() == 0:
             subjects = subjects.view(1)
 
-        # Helpers internos: mezcla I↔A_s y jitter SPD
+        # Helper interno: mezcla I↔A_s
         def _blend_filter(A_np: np.ndarray, alpha: float) -> np.ndarray:
             # exp(alpha*log(A)) (suavemente entre I y A)
             w, V = np.linalg.eigh(A_np)
@@ -438,18 +437,6 @@ class ITSA:
             w_alpha = np.exp(alpha * np.log(w))
             A_blend = (V * w_alpha) @ V.T
             return 0.5 * (A_blend + A_blend.T)
-
-        def _spd_jitter(C_np: np.ndarray, sigma: float = 0.02) -> np.ndarray:
-            # C_jit = exp( log(C) + N(0, sigma^2 I) )
-            w, V = np.linalg.eigh(C_np)
-            w = np.clip(w, 1e-8, None)
-            logC = (V * np.log(w)) @ V.T
-            d = logC.shape[0]
-            noise = sigma * np.random.randn(d, d)
-            noise = 0.5 * (noise + noise.T)
-            w2, V2 = np.linalg.eigh(logC + noise)
-            C_noisy = (V2 * np.exp(w2)) @ V2.T
-            return 0.5 * (C_noisy + C_noisy.T)
 
         # Aplicar A_s por lote con caché GPU
         out = []
@@ -474,21 +461,6 @@ class ITSA:
 
             # Aplicamos el filtro: (T,C) @ (C,C) -> (T,C)
             xb = x_[b].to(torch.float32) @ A_t
-
-            # Jitter SPD opcional (solo en augment)
-            if mode == "augment" and jitter_sigma > 0:
-                from pyriemann.utils.base import invsqrtm, sqrtm
-                # cov(xb) -> jitter -> recolorear xb
-                Cb = (xb - xb.mean(dim=0, keepdim=True))
-                Cb = (Cb.t() @ Cb) / max(1, xb.shape[0] - 1)
-                Cb = Cb + 1e-4 * torch.eye(Cb.shape[0], device=Cb.device, dtype=Cb.dtype)
-                Cb_np = Cb.detach().cpu().numpy()
-                Cb_j = _spd_jitter(Cb_np, sigma=jitter_sigma)  # (C,C) numpy
-                # W = C^{-1/2} * Cj^{1/2}
-                W = invsqrtm(Cb_np) @ sqrtm(Cb_j)
-                W_t = torch.from_numpy(W.astype(np.float32)).to(device=xb.device)
-                xb = xb @ W_t  # (T,C) @ (C,C)
-
             out.append(xb)
 
         Xout = torch.stack(out, dim=0)  # (B,T,C)
@@ -629,8 +601,7 @@ class ITSAIntegrator:
     @_torch.no_grad()
     def transform_batch(self, x: _torch.Tensor, subjects: _torch.Tensor,
                         mode: str = "deterministic",
-                        alpha_range=(1.0, 1.0),
-                        jitter_sigma: float = 0.0) -> _torch.Tensor:
+                        alpha_range=(1.0, 1.0)) -> _torch.Tensor:
         """
         Aplica ITSA por sujeto. Conserva la forma de x:
         - (B,T,C) -> (B,T,C)
@@ -638,5 +609,4 @@ class ITSAIntegrator:
         """
         return self._itsa.transform_signals(x, subjects,
                                             mode=mode,
-                                            alpha_range=alpha_range,
-                                            jitter_sigma=jitter_sigma)
+                                            alpha_range=alpha_range)

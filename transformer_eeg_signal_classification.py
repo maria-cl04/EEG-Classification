@@ -256,8 +256,7 @@ for epoch in range(1, opt.epochs + 1):
                 if split == "train":
                     input = itsa.transform_batch(input, batch_subjects,
                                                  mode="augment",
-                                                 alpha_range=(0.5, 0.95),
-                                                 jitter_sigma=0.015)
+                                                 alpha_range=(0.5, 0.95))
                 else:
                     input = itsa.transform_batch(input, batch_subjects,
                                                  mode="deterministic")
