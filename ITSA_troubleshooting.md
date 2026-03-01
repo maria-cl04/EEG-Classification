@@ -8,9 +8,11 @@ It also describes why each problem occurred and how it was fixed.
 
 ### **Why it happened**
 ITSA stores giant matrices, `Rs_` (subject‑specific rotations), in Tangent Space. Their size is `d x d`, where
-  \[
- d = \frac{C(C+1)}{2} \quad (e.g., C=128 ⇒ d is very large)
- \]
+
+$$
+ d = \frac{C(C+1)}{2} \quad \text{(e.g., C=128 ⇒ d is very large)}
+$$
+
 For EEG with 128 channels, these matrices are *huge*, and storing them for 5 subjects, for the pre-training part of the fine-tuning, explodes file size.
 
 - **Early attempt**
@@ -59,7 +61,12 @@ def export_light(self):
     return lite
 ```
 
-**Result**: The saved file goes from GB -> a few MB, while still being sufficient to **adapt** later to the target subject and derive the small spatial filter \(A_s \in \mathbb{R}^{C\times C}\).
+**Result**: The saved file goes from GB -> a few MB, while still being sufficient to **adapt** later to the target subject and derive the small spatial filter.
+
+$$
+A_s \in \mathbb{R}^{C\times C}
+$$
+
 
 ---
 
@@ -67,17 +74,21 @@ def export_light(self):
 
 ### Why it happened
 I was applying ITSA as a **fixed deterministic spatila mapping** per subject:
-  \[
-  x \mapsto x\,A_s
-  \]
+
+$$
+x \mapsto x\,A_s
+$$
+
 That aligns domains but does **not** provide *augmentation*: the model sees **one** ITSA-view of each trial, with no diversity -> small or inconsisten gains.
 
 ### Fix: Treat ITSA as **real augmentation** in train, and keep it **deterministic** in val/test
 
 - **Train:** blend between **identity** and **alignment** using a geodesic‑style interpolation,
-  \[
-  A_\alpha = \exp\big(\alpha \,\log(A_s)\big),\quad \alpha \sim \text{Uniform}(a,b)
-  \]
+- 
+$$
+A_\alpha = \exp\big(\alpha \,\log(A_s)\big),\quad \alpha \sim \text{Uniform}(a,b)
+$$
+
   plus an optional **SPD jitter** (very small) for robustness.
 - **Val/Test:** apply **pure \(A_s\)** (deterministic), so evaluation is stable and consistent with deployment.
 
@@ -214,7 +225,7 @@ for i, (input, target, batch_subjects) in enumerate(loaders[split]):
 
 ---
 
-## TL;DR
+## Summary
 
 - **Space issue:** solved with `export_light()` (keep `ts_`, `scaler_`, `mu_global_`, `reference_G_`; drop heavy fields).  
 - **No improvement with ITSA:** fixed by using ITSA as *augmentation* in **train** (I↔Aₛ + jitter) and **deterministic** in **val/test**.  
