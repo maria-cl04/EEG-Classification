@@ -269,6 +269,11 @@ class ITSA:
             self.A_filters_[s] = self.M_inv_sqrt_[s] @ W_s
 
         self._filters_cache.clear()  # Limpiamos caché GPU
+
+        # ITSA.py, al final de adapt_subject:
+        self.Rs_.clear()  # ya no necesitamos R una vez derivado A_s
+        self._filters_cache.clear()  # fuerza recacheo en device/dtype correctos
+
         return self
 
     # --------------------------- API clásica (features) ----------------------
@@ -385,7 +390,14 @@ class ITSA:
             self.A_filters_[s] = A_s
 
     @torch.no_grad()
-    def transform_signals(self, x: torch.Tensor, subjects: torch.Tensor) -> torch.Tensor:
+    def transform_signals(
+            self,
+            x: torch.Tensor,
+            subjects: torch.Tensor,
+            mode: str = "deterministic",  # "augment" | "deterministic"
+            alpha_range=(1.0, 1.0),  # si augment: mezcla I↔A_s, p.ej. (0.5, 0.95)
+            jitter_sigma: float = 0.0  # jitter SPD opcional, p.ej. 0.01–0.02
+    ) -> torch.Tensor:
         """
         Aplica el filtro espacial por sujeto y devuelve la MISMA forma que x.
         x: torch.Tensor con forma (B,T,C), (B,1,C,T) o (T,C)
@@ -417,11 +429,33 @@ class ITSA:
         elif subjects.dim() == 0:
             subjects = subjects.view(1)
 
+        # Helpers internos: mezcla I↔A_s y jitter SPD
+        def _blend_filter(A_np: np.ndarray, alpha: float) -> np.ndarray:
+            # exp(alpha*log(A)) (suavemente entre I y A)
+            w, V = np.linalg.eigh(A_np)
+            w = np.clip(w, 1e-8, None)
+            # exp(alpha*log(w))
+            w_alpha = np.exp(alpha * np.log(w))
+            A_blend = (V * w_alpha) @ V.T
+            return 0.5 * (A_blend + A_blend.T)
+
+        def _spd_jitter(C_np: np.ndarray, sigma: float = 0.02) -> np.ndarray:
+            # C_jit = exp( log(C) + N(0, sigma^2 I) )
+            w, V = np.linalg.eigh(C_np)
+            w = np.clip(w, 1e-8, None)
+            logC = (V * np.log(w)) @ V.T
+            d = logC.shape[0]
+            noise = sigma * np.random.randn(d, d)
+            noise = 0.5 * (noise + noise.T)
+            w2, V2 = np.linalg.eigh(logC + noise)
+            C_noisy = (V2 * np.exp(w2)) @ V2.T
+            return 0.5 * (C_noisy + C_noisy.T)
+
         # Aplicar A_s por lote con caché GPU
         out = []
         for b in range(B):
-            s = int(subjects[b].item())
-            key = (s, device, dtype)
+            s = int(subjects[b].item()) if subjects.numel() > 1 else int(subjects.item())
+            key = (s, device, torch.float32)  # cache en float32 para estabilidad
 
             # Intentamos recuperar el filtro ya convertido y en el device correcto
             A_t = self._filters_cache.get(key)
@@ -429,13 +463,32 @@ class ITSA:
                 # Cargamos el filtro desde el diccionario de NumPy (learned in fit)
                 A_np = self.A_filters_.get(s, None) if self.A_filters_ is not None else None
                 if A_np is None:
-                    A_t = torch.eye(C, device=device, dtype=dtype)
+                    A_t = torch.eye(C, device=device, dtype=torch.float32)
                 else:
-                    A_t = torch.from_numpy(A_np).to(device=device, dtype=dtype)
+                    # Mezcla I↔A_s si augment
+                    if mode == "augment":
+                        alpha = np.random.uniform(alpha_range[0], alpha_range[1])
+                        A_np = _blend_filter(A_np, alpha)
+                    A_t = torch.from_numpy(A_np.astype(np.float32)).to(device=device)
                 self._filters_cache[key] = A_t  # guardamos en caché para el próximo batch
 
             # Aplicamos el filtro: (T,C) @ (C,C) -> (T,C)
-            xb = x_[b] @ A_t
+            xb = x_[b].to(torch.float32) @ A_t
+
+            # Jitter SPD opcional (solo en augment)
+            if mode == "augment" and jitter_sigma > 0:
+                from pyriemann.utils.base import invsqrtm, sqrtm
+                # cov(xb) -> jitter -> recolorear xb
+                Cb = (xb - xb.mean(dim=0, keepdim=True))
+                Cb = (Cb.t() @ Cb) / max(1, xb.shape[0] - 1)
+                Cb = Cb + 1e-4 * torch.eye(Cb.shape[0], device=Cb.device, dtype=Cb.dtype)
+                Cb_np = Cb.detach().cpu().numpy()
+                Cb_j = _spd_jitter(Cb_np, sigma=jitter_sigma)  # (C,C) numpy
+                # W = C^{-1/2} * Cj^{1/2}
+                W = invsqrtm(Cb_np) @ sqrtm(Cb_j)
+                W_t = torch.from_numpy(W.astype(np.float32)).to(device=xb.device)
+                xb = xb @ W_t  # (T,C) @ (C,C)
+
             out.append(xb)
 
         Xout = torch.stack(out, dim=0)  # (B,T,C)
@@ -447,6 +500,27 @@ class ITSA:
             return Xout.squeeze(0)  # (T,C)
         return Xout
 
+    # En ITSA.py (clase ITSA) --> para exportar SOLO los datos necesarios
+    # ej. si se exportáse Rs_, el archivo ocuparía varios GB
+    def export_light(self):
+        lite = ITSA(
+            subject_eps=self.subject_eps,
+            mean_tol=self.mean_tol,
+            mean_maxiter=self.mean_maxiter,
+            unit_trace_per_subject=self.unit_trace_per_subject
+        )
+        # Conservamos lo imprescindible
+        lite.ts_ = self.ts_
+        lite.scaler_ = self.scaler_
+        lite.mu_global_ = {int(k): v.astype(np.float32) for k, v in self.mu_global_.items()}
+
+        # Eliminamos/compactamos el resto
+        lite.reference_G_ = self.reference_G_  # (C,C), puedes castear a float32 si quieres
+        lite.M_inv_sqrt_ = {}  # no necesitamos las de sujetos base
+        lite.Rs_ = {}  # enorme → fuera
+        lite.A_filters_ = None  # se derivan en la adaptación al destino
+        lite._filters_cache = {}  # limpio
+        return lite
 
 # ------------------------------ Integrador minimalista ------------------------------
 import torch as _torch  # alias local para evitar sombra de nombre
@@ -553,10 +627,16 @@ class ITSAIntegrator:
         return self
 
     @_torch.no_grad()
-    def transform_batch(self, x: _torch.Tensor, subjects: _torch.Tensor) -> _torch.Tensor:
+    def transform_batch(self, x: _torch.Tensor, subjects: _torch.Tensor,
+                        mode: str = "deterministic",
+                        alpha_range=(1.0, 1.0),
+                        jitter_sigma: float = 0.0) -> _torch.Tensor:
         """
         Aplica ITSA por sujeto. Conserva la forma de x:
         - (B,T,C) -> (B,T,C)
         - (B,1,C,T) -> (B,1,C,T)
         """
-        return self._itsa.transform_signals(x, subjects)
+        return self._itsa.transform_signals(x, subjects,
+                                            mode=mode,
+                                            alpha_range=alpha_range,
+                                            jitter_sigma=jitter_sigma)

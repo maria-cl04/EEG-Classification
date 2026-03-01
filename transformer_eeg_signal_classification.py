@@ -58,6 +58,7 @@ parser.add_argument('--no-cuda', default=False, help="disable CUDA", action="sto
 
 # cargar objeto ITSA guardado
 parser.add_argument('--pretrained_itsa', default='', help="path to pre-trained itsa")
+parser.add_argument('--itsa_off', default=False, help="turn ITSA off")
 
 # Parse arguments
 opt = parser.parse_args()
@@ -162,18 +163,14 @@ dataset = EEGDataset(opt.eeg_dataset)
 loaders = {split: DataLoader(Splitter(dataset, split_path=opt.splits_path, split_num=opt.split_num, split_name=split),
                              batch_size=opt.batch_size, drop_last=True, shuffle=True) for split in
            ["train", "val", "test"]}
-
-if opt.pretrained_itsa != '':
-    itsa = torch.load(opt.pretrained_itsa)
-    itsa.adapt_from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
-else:
-    itsa = ITSAIntegrator.from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
-
-    itsa_to_save = itsa
-    # Eliminar rotaciones gigantes
-    if hasattr(itsa_to_save._itsa, "Rs_"):
-        itsa_to_save._itsa.Rs_ = {}
-    torch.save(itsa_to_save, 'itsa_pretrained_space.pth')
+if not opt.itsa_off:
+    if opt.pretrained_itsa != '':
+        itsa = torch.load(opt.pretrained_itsa)
+        itsa.adapt_from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
+    else:
+        itsa = ITSAIntegrator.from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
+        itsa_lite = itsa._itsa.export_light()
+        torch.save(itsa_lite, 'itsa_pretrained_space_light.pth')
 
 # Load model
 model_options = {key: int(value) if value.isdigit() else (float(value) if value[0].isdigit() else value) for
@@ -255,7 +252,15 @@ for epoch in range(1, opt.epochs + 1):
                 target = target.to("cuda")
                 batch_subjects = batch_subjects.to("cuda")
             # Forward
-            input = itsa.transform_batch(input, batch_subjects)
+            if not opt.itsa_off:
+                if split == "train":
+                    input = itsa.transform_batch(input, batch_subjects,
+                                                 mode="augment",
+                                                 alpha_range=(0.5, 0.95),
+                                                 jitter_sigma=0.015)
+                else:
+                    input = itsa.transform_batch(input, batch_subjects,
+                                                 mode="deterministic")
             output = model(input)
 
             # Compute loss
