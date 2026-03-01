@@ -383,6 +383,68 @@ Instead of patching dictionaries one by one, I added a robust initialization blo
             # ... adaptation loop continues ...
 ```
 ---
+## 9. Future-Proofing ITSA Reusability (Skipping the 1-Hour Base Calculation)
+
+### Why it happened
+When attempting to objectively compare models, I needed to retrain the base Transformer on the 5 calibration subjects *with* ITSA enabled. However, the `export_light()` method was aggressively dropping the `A_filters_` dictionary to save disk space. Because of this, loading the "light" `pretrained_itsa` model forced the script to re-compute the Riemannian geometry and spatial filters for the 5 base subjects from scratch, which takes around an hour. Furthermore, the main training script always assumed that providing a `pretrained_itsa` meant we wanted to *adapt* it to a new subject, making it impossible to just "load and train" on the original subjects.
+
+### Fix
+I implemented a two-step solution to make the ITSA pipeline flexible and reusable:
+1. **Retain Base Filters:** Modified `export_light()` to keep `A_filters_` (since spatial filters are very small, 128x128 matrices, unlike the massive `Rs_` rotation matrices).
+2. **Add an Adaptation Flag:** Added an `--adapt_new_subject` boolean flag to the main script parser to explicitly distinguish between "loading base filters for retraining" and "adapting filters for fine-tuning on a new subject".
+
+**1. Updated `export_light` in `ITSA.py`:**
+```python
+    def export_light(self):
+        lite = ITSA(
+            subject_eps=self.subject_eps,
+            mean_tol=self.mean_tol,
+            mean_maxiter=self.mean_maxiter,
+            unit_trace_per_subject=self.unit_trace_per_subject
+        )
+        lite.ts_ = self.ts_
+        lite.scaler_ = self.scaler_
+        lite.mu_global_ = {int(k): v.astype(np.float32) for k, v in self.mu_global_.items()}
+        lite.reference_G_ = self.reference_G_
+        
+        lite.M_inv_sqrt_ = {}
+        lite.Rs_ = {}  # Enormous matrices -> dropped
+        lite.A_filters_ = self.A_filters_  # KEEP the spatial filters
+        lite._filters_cache = {} 
+        return lite
+```
+
+**2. Updated Main Script (`transformer_eeg_signal_classification.py`):**
+```python
+# Added to parser:
+parser.add_argument('--adapt_new_subject', default=False, action="store_true", help="Adapt pretrained ITSA to a new subject")
+
+# Updated integration logic:
+if not opt.itsa_off:
+    if opt.pretrained_itsa != '':
+        # 1. Load the core object and re-wrap it
+        loaded_itsa_core = torch.load(opt.pretrained_itsa, weights_only=False)
+        itsa = ITSAIntegrator(loaded_itsa_core)
+        
+        # 2. Check if we need to adapt or just load
+        if opt.adapt_new_subject:
+            print("Adaptando espacio ITSA al nuevo sujeto...")
+            itsa.adapt_from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
+        else:
+            print("Cargando filtros ITSA base (sin adaptar)...")
+            
+    else:
+        print("Calculando espacio ITSA desde cero (¡paciencia!)...")
+        itsa = ITSAIntegrator.from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
+        itsa_lite = itsa._itsa.export_light()
+        torch.save(itsa_lite, 'itsa_pretrained_space_light.pth')
+```
+
+### Usage for future experiments:
+* **To retrain the base model quickly:** `--pretrained_itsa itsa_pretrained_space_light.pth`
+* **To fine-tune on a new target subject:** `--pretrained_itsa itsa_pretrained_space_light.pth --adapt_new_subject`
+
+---
 
 ## Summary
 
