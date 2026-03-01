@@ -250,6 +250,114 @@ input = itsa.transform_batch(
 )
 ```
 ---
+## 6. Problem: Silent Caching Bug and CPU Bottleneck in Augmentation
+
+### Why it happened
+While reviewing the geodesic augmentation in `ITSA.transform_signals(...)`, I discovered two critical issues that were hindering both the model's learning and the training speed:
+
+1. **The Silent Caching Bug (Loss of Stochasticity):**
+   The code was generating a random `alpha`, blending the filter ($A_\alpha$), and then **saving that augmented filter into the cache** (`self._filters_cache[key] = A_t`). Consequently, the random augmentation was only computed once per subject during the very first batch. For the rest of the epoch (and subsequent epochs), the exact same augmented matrix was recycled. The model was just memorizing a fixed mapping instead of seeing diverse views.
+2. **The CPU/GPU Bottleneck:**
+   The `_blend_filter` helper was using NumPy (`np.linalg.eigh`), which runs on the CPU. Inside the training loop, the code was constantly pulling tensors to the CPU, performing complex eigendecompositions, and pushing them back to the GPU (`to(device=device)`). This broke parallelism and starved the GPU.
+
+### Fix: Native PyTorch Blending and Correct Cache Targeting
+
+**1. Fix the Cache Logic:**
+I modified the caching mechanism to store *only* the deterministic base spatial filter ($A_s$) on the GPU. The stochastic interpolation is now applied *on the fly* during every forward pass without overwriting the cached base filter.
+
+**2. Move Math to the GPU:**
+I rewrote the blending helper to use native PyTorch operations (`torch.linalg.eigh`, `torch.clamp`, `torch.exp`). This keeps all matrices on the GPU, avoiding PCIe transfer delays and drastically speeding up the batches.
+
+**Updated `transform_signals` implementation:**
+```python
+    @torch.no_grad()
+    def transform_signals(
+            self,
+            x: torch.Tensor,
+            subjects: torch.Tensor,
+            mode: str = "deterministic",
+            alpha_range=(1.0, 1.0)
+    ) -> torch.Tensor:
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x)
+
+        device = x.device
+
+        # Normalize to (B,T,C)
+        squeeze_4d = False
+        if x.dim() == 4:  # (B,1,C,T)
+            squeeze_4d = True
+            x_ = x.squeeze(1).transpose(1, 2)
+        elif x.dim() == 3:  # (B,T,C)
+            x_ = x
+        elif x.dim() == 2:  # (T,C) -> (1,T,C)
+            x_ = x.unsqueeze(0)
+        else:
+            raise ValueError(f"Forma no soportada: {tuple(x.shape)}")
+
+        B, T, C = x_.shape
+
+        if not torch.is_tensor(subjects):
+            subjects = torch.tensor([int(subjects)], device=device)
+        elif subjects.dim() == 0:
+            subjects = subjects.view(1)
+
+        # PyTorch NATIVE helper: 100% on GPU, extremely fast
+        def _blend_filter_torch(A_t: torch.Tensor, alpha: float) -> torch.Tensor:
+            w, V = torch.linalg.eigh(A_t)
+            w = torch.clamp(w, min=1e-8)
+            w_alpha = torch.exp(alpha * torch.log(w))
+            A_blend = (V * w_alpha.unsqueeze(0)) @ V.transpose(-1, -2)
+            return 0.5 * (A_blend + A_blend.transpose(-1, -2))
+
+        out = []
+        for b in range(B):
+            s = int(subjects[b].item()) if subjects.numel() > 1 else int(subjects.item())
+            key = (s, device, torch.float32)
+
+            # 1. Retrieve (or create) the BASE deterministic filter from cache
+            A_base = self._filters_cache.get(key)
+            if A_base is None:
+                A_np = self.A_filters_.get(s, None) if self.A_filters_ is not None else None
+                if A_np is None:
+                    A_base = torch.eye(C, device=device, dtype=torch.float32)
+                else:
+                    A_base = torch.from_numpy(A_np.astype(np.float32)).to(device=device)
+                # Cache ONLY the deterministic base matrix
+                self._filters_cache[key] = A_base  
+
+            # 2. Apply stochastic augmentation ON THE FLY (GPU)
+            if mode == "augment":
+                alpha = np.random.uniform(alpha_range[0], alpha_range[1])
+                A_t = _blend_filter_torch(A_base, alpha)
+            else:
+                A_t = A_base
+
+            # 3. Apply the filter: (T,C) @ (C,C) -> (T,C)
+            xb = x_[b].to(torch.float32) @ A_t
+            out.append(xb)
+
+        Xout = torch.stack(out, dim=0)
+
+        if squeeze_4d:
+            return Xout.transpose(1, 2).unsqueeze(1)
+        if x.dim() == 2:
+            return Xout.squeeze(0)
+        return Xout
+```
+---
+## 7. Code Cleanup: Removing Technical Debt in `ITSA.py`
+
+### Why it happened
+`ITSA.py` had a bit of an "identity crisis", keeping legacy methods that belonged to classic Machine Learning (SVMs) while the pipeline only required Deep Learning logic (Transformers). It also had redundant aliases and duplicated cleanup calls.
+
+### Fix
+I safely removed the dead code to improve readability and reduce file bloat:
+* **Removed `transform(self, covs, subjects)`:** This method extracted 1D Tangent Space features. It was completely unused since `transformer_eeg_signal_classification.py` exclusively calls `transform_signals`.
+* **Cleaned up `ITSAIntegrator`:** Removed the redundant `import torch as _torch` alias, standardizing everything to use the standard `torch` imports.
+* **Removed duplicate cache clears:** Cleaned up redundant `self._filters_cache.clear()` and `self.Rs_.clear()` lines at the end of `adapt_subject`.
+
+---
 
 ## Summary
 
