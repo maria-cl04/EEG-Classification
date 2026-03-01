@@ -359,6 +359,31 @@ I safely removed the dead code to improve readability and reduce file bloat:
 
 ---
 
+## 8. Problem: Hidden "NoneType" Assignment Errors on Outdated Exports
+
+### Why it happened
+Shortly after fixing the `A_filters_` assignment error, another `TypeError: 'NoneType' object does not support item assignment` appeared, this time pointing near the `self.Rs_[s]` access. Because Jupyter tracebacks can occasionally misalign line numbers after cell modifications, the traceback pointed to a read operation, but the underlying crash happened at the assignment step (`self.Rs_[s] = ...`). 
+This indicated that the loaded `.pth` model (likely an older version of `export_light()`) had also saved `Rs_`, `M_inv_sqrt_`, or other core dictionaries as `None` instead of empty dictionaries `{}`.
+
+### Fix
+Instead of patching dictionaries one by one, I added a robust initialization block (a "None-shield") at the very beginning of the `adapt_subject` method. Using `getattr()` ensures that even if the attributes are missing entirely from the loaded object, they are safely initialized as empty dictionaries before any loop starts.
+
+**Updated code in `ITSA.py` (`adapt_subject` method):**
+```python
+        mask_tr = np.zeros(covs_np.shape[0], dtype=bool)
+        mask_tr[train_idx_np] = True
+
+        # Robust Initialization (Shield against NoneType from light exports)
+        if getattr(self, "M_inv_sqrt_", None) is None: self.M_inv_sqrt_ = {}
+        if getattr(self, "Rs_", None) is None: self.Rs_ = {}
+        if getattr(self, "A_filters_", None) is None: self.A_filters_ = {}
+        if getattr(self, "_filters_cache", None) is None: self._filters_cache = {}
+
+        for s in np.unique(subjects_np):
+            # ... adaptation loop continues ...
+```
+---
+
 ## Summary
 
 * **Space issue:** Solved with `export_light()` (keep `ts_`, `scaler_`, `mu_global_`, `reference_G_`; drop heavy fields).  
