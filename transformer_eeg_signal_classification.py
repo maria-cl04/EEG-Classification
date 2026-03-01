@@ -59,6 +59,7 @@ parser.add_argument('--no-cuda', default=False, help="disable CUDA", action="sto
 # cargar objeto ITSA guardado
 parser.add_argument('--pretrained_itsa', default='', help="path to pre-trained itsa")
 parser.add_argument('--itsa_off', default=False, help="turn ITSA off")
+parser.add_argument('--adapt_new_subject', default=False, action="store_true", help="Adapt pretrained ITSA to a new subject")
 
 # Parse arguments
 opt = parser.parse_args()
@@ -167,10 +168,13 @@ if not opt.itsa_off:
     if opt.pretrained_itsa != '':
         # 1. Cargamos el objeto ITSA core (la versión "ligera")
         loaded_itsa_core = torch.load(opt.pretrained_itsa, weights_only=False)
-        # 2. Lo volvemos a envolver en el Integrator
         itsa = ITSAIntegrator(loaded_itsa_core)
-        # 3. ¡Ahora sí podemos llamar a adapt_from_dataset!
-        itsa.adapt_from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
+        # 2. ¿Adaptamos o solo cargamos?
+        if opt.adapt_new_subject:
+            print("Adaptando espacio ITSA al nuevo sujeto...")
+            itsa.adapt_from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
+        else:
+            print("Cargando filtros ITSA base (sin adaptar)...")
     else:
         itsa = ITSAIntegrator.from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
         itsa_lite = itsa._itsa.export_light()

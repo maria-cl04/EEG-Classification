@@ -218,10 +218,12 @@ class ITSA:
         mask_tr = np.zeros(covs_np.shape[0], dtype=bool)
         mask_tr[train_idx_np] = True
 
-        # --- AÑADIR ESTAS DOS LÍNEAS ---
-        if self.A_filters_ is None:
-            self.A_filters_ = {}
-        # -------------------------------
+        # --- ESCUDO ANTI-NONE (Robust Initialization) ---
+        if getattr(self, "M_inv_sqrt_", None) is None: self.M_inv_sqrt_ = {}
+        if getattr(self, "Rs_", None) is None: self.Rs_ = {}
+        if getattr(self, "A_filters_", None) is None: self.A_filters_ = {}
+        if getattr(self, "_filters_cache", None) is None: self._filters_cache = {}
+        # ------------------------------------------------
 
         for s in np.unique(subjects_np):
             s = int(s)
@@ -458,7 +460,7 @@ class ITSA:
         lite.reference_G_ = self.reference_G_  # (C,C), puedes castear a float32 si quieres
         lite.M_inv_sqrt_ = {}  # no necesitamos las de sujetos base
         lite.Rs_ = {}  # enorme → fuera
-        lite.A_filters_ = None  # se derivan en la adaptación al destino
+        lite.A_filters_ = self.A_filters_  # Conservamos los filtros base (pesan poquísimo)
         lite._filters_cache = {}  # limpio
         return lite
 
