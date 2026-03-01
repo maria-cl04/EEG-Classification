@@ -9,7 +9,7 @@ It also describes why each problem occurred and how it was fixed.
 ### Why it happened
 ITSA stores giant matrices, `Rs_` (subject‑specific rotations), in Tangent Space. Their size is `d x d`, where:
 
-$$d = \frac{C(C+1)}{2} \quad \text{(e.g., C=128 \Rightarrow d is very large)}$$
+$$d = \frac{C(C+1)}{2} \quad \text{(e.g., C=128 }\Rightarrow\text{ d is very large)}$$
 
 For EEG with 128 channels, these matrices are *huge*, and storing them for 5 subjects, for the pre-training part of the fine-tuning, explodes file size.
 
@@ -212,6 +212,43 @@ C = cov_from_signal_torch(eeg2d.double(), eps=1e-4).cpu().numpy()  # (C,C) SPD
 ### 4.4 Main‑file integration of ITSA (driver)
 - I consolidated all ITSA changes in the *train/val/test* loop and added an `--itsa_off` switch (as seen in Section 2.3).
 
+---
+
+## 5. Problem: Jitter Augmentation Caused NaNs and Bloated the Code (The "Hard-Remove")
+
+### Why it happened (The Issue)
+Initially, `jitter_sigma` was implemented as a secondary augmentation strategy during training. The idea was to inject tiny, SPD-preserving spectral perturbations into the covariance matrices to make the model more robust. 
+
+However, in practice, this approach introduced several critical issues:
+1.  **Numerical Instability:** It frequently caused NaNs during training unless heavy eigenvalue floors were applied, which distorted the data.
+2.  **High Computational Overhead:** It required additional, expensive eigendecompositions (`invsqrtm`, `sqrtm`) on the fly, significantly slowing down the training loop.
+3.  **Lack of Empirical Benefit:** The geodesic blending (`alpha_range=(0.5, 0.95)`) already provided sufficient and stable data augmentation. The jitter did not improve the final classification results.
+
+### The Decision: "Hard-Remove" vs "Soft-Remove"
+Initially, the idea was to "soft-remove" the jitter (leaving the arguments in the functions but disabling the internal logic). However, `ITSA.py` is a core file with over 600 lines of code. Keeping "zombie code" (dead arguments, unused helper functions, and commented-out logic blocks) only adds technical debt, reduces readability, and creates confusion for future maintenance. Therefore, a **complete removal (hard-remove)** was the cleanest and most professional solution.
+
+### How it was fixed (The Solution)
+I completely stripped out all jitter-related logic across the pipeline to streamline the augmentation process:
+
+* **In `ITSA.py` (Main Class):**
+    * Removed the `jitter_sigma` argument from the `transform_signals` signature.
+    * Deleted the unused `_spd_jitter` helper function.
+    * Removed the entire conditional block (`if mode == "augment" and jitter_sigma > 0:`) that handled the recoloring and noise injection.
+* **In `ITSA.py` (`ITSAIntegrator` Wrapper):**
+    * Removed `jitter_sigma` from the `transform_batch` signature.
+    * Stopped forwarding the parameter to `self._itsa.transform_signals`.
+* **In the Main Training Loop (`transformer_eeg_signal_classification.py`):**
+    * Removed the `jitter_sigma=0.015` parameter from the `itsa.transform_batch` call during the `train` split.
+
+**Final, clean usage for augmentation:**
+The pipeline now relies purely on geodesic interpolation, which is numerically stable and fast:
+```python
+input = itsa.transform_batch(
+    input, batch_subjects,
+    mode="augment",
+    alpha_range=(0.5, 0.95)
+)
+```
 ---
 
 ## Summary
