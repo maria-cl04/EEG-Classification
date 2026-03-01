@@ -394,82 +394,74 @@ class ITSA:
             self,
             x: torch.Tensor,
             subjects: torch.Tensor,
-            mode: str = "deterministic",  # "augment" | "deterministic"
-            alpha_range=(1.0, 1.0)  # si augment: mezcla I↔A_s, p.ej. (0.5, 0.95)
+            mode: str = "deterministic",
+            alpha_range=(1.0, 1.0)
     ) -> torch.Tensor:
-        """
-        Aplica el filtro espacial por sujeto y devuelve la MISMA forma que x.
-        x: torch.Tensor con forma (B,T,C), (B,1,C,T) o (T,C)
-        subjects: torch.LongTensor con ids de sujeto (B,) o escalar si x es 2D
-        """
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
 
         device = x.device
-        dtype = x.dtype
 
         # Normalizar a (B,T,C)
         squeeze_4d = False
         if x.dim() == 4:  # (B,1,C,T)
             squeeze_4d = True
-            B, _, C, T = x.shape
             x_ = x.squeeze(1).transpose(1, 2)  # -> (B,T,C)
         elif x.dim() == 3:  # (B,T,C)
             x_ = x
-            B, T, C = x_.shape
         elif x.dim() == 2:  # (T,C) -> (1,T,C)
             x_ = x.unsqueeze(0)
-            B, T, C = x_.shape
         else:
             raise ValueError(f"Forma no soportada: {tuple(x.shape)}")
+
+        B, T, C = x_.shape
 
         if not torch.is_tensor(subjects):
             subjects = torch.tensor([int(subjects)], device=device)
         elif subjects.dim() == 0:
             subjects = subjects.view(1)
 
-        # Helper interno: mezcla I↔A_s
-        def _blend_filter(A_np: np.ndarray, alpha: float) -> np.ndarray:
-            # exp(alpha*log(A)) (suavemente entre I y A)
-            w, V = np.linalg.eigh(A_np)
-            w = np.clip(w, 1e-8, None)
-            # exp(alpha*log(w))
-            w_alpha = np.exp(alpha * np.log(w))
-            A_blend = (V * w_alpha) @ V.T
-            return 0.5 * (A_blend + A_blend.T)
+        # Helper NATIVO de PyTorch: 100% en la GPU y ultra rápido
+        def _blend_filter_torch(A_t: torch.Tensor, alpha: float) -> torch.Tensor:
+            w, V = torch.linalg.eigh(A_t)
+            w = torch.clamp(w, min=1e-8)
+            w_alpha = torch.exp(alpha * torch.log(w))
+            A_blend = (V * w_alpha.unsqueeze(0)) @ V.transpose(-1, -2)
+            return 0.5 * (A_blend + A_blend.transpose(-1, -2))
 
-        # Aplicar A_s por lote con caché GPU
         out = []
         for b in range(B):
             s = int(subjects[b].item()) if subjects.numel() > 1 else int(subjects.item())
-            key = (s, device, torch.float32)  # cache en float32 para estabilidad
+            key = (s, device, torch.float32)
 
-            # Intentamos recuperar el filtro ya convertido y en el device correcto
-            A_t = self._filters_cache.get(key)
-            if A_t is None:
-                # Cargamos el filtro desde el diccionario de NumPy (learned in fit)
+            # 1. Recuperar (o crear) el filtro BASE desde la caché
+            A_base = self._filters_cache.get(key)
+            if A_base is None:
                 A_np = self.A_filters_.get(s, None) if self.A_filters_ is not None else None
                 if A_np is None:
-                    A_t = torch.eye(C, device=device, dtype=torch.float32)
+                    A_base = torch.eye(C, device=device, dtype=torch.float32)
                 else:
-                    # Mezcla I↔A_s si augment
-                    if mode == "augment":
-                        alpha = np.random.uniform(alpha_range[0], alpha_range[1])
-                        A_np = _blend_filter(A_np, alpha)
-                    A_t = torch.from_numpy(A_np.astype(np.float32)).to(device=device)
-                self._filters_cache[key] = A_t  # guardamos en caché para el próximo batch
+                    A_base = torch.from_numpy(A_np.astype(np.float32)).to(device=device)
+                # OJO AQUI: Cacheamos SOLO la matriz determinista base
+                self._filters_cache[key] = A_base
 
-            # Aplicamos el filtro: (T,C) @ (C,C) -> (T,C)
+                # 2. Aplicar aumentación estocástica AL VUELO en la GPU
+            if mode == "augment":
+                alpha = np.random.uniform(alpha_range[0], alpha_range[1])
+                A_t = _blend_filter_torch(A_base, alpha)
+            else:
+                A_t = A_base
+
+            # 3. Aplicar el filtro: (T,C) @ (C,C) -> (T,C)
             xb = x_[b].to(torch.float32) @ A_t
             out.append(xb)
 
-        Xout = torch.stack(out, dim=0)  # (B,T,C)
+        Xout = torch.stack(out, dim=0)
 
-        # Volver a la forma original
         if squeeze_4d:
-            return Xout.transpose(1, 2).unsqueeze(1)  # (B,1,C,T)
+            return Xout.transpose(1, 2).unsqueeze(1)
         if x.dim() == 2:
-            return Xout.squeeze(0)  # (T,C)
+            return Xout.squeeze(0)
         return Xout
 
     # En ITSA.py (clase ITSA) --> para exportar SOLO los datos necesarios
