@@ -168,7 +168,12 @@ if opt.pretrained_itsa != '':
     itsa.adapt_from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
 else:
     itsa = ITSAIntegrator.from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
-    torch.save(itsa, 'itsa_pretrained_space_subject%d.pth' % (opt.subject))
+
+    itsa_to_save = itsa
+    # Eliminar rotaciones gigantes
+    if hasattr(itsa_to_save._itsa, "Rs_"):
+        itsa_to_save._itsa.Rs_ = {}
+    torch.save(itsa_to_save, 'itsa_pretrained_space.pth')
 
 # Load model
 model_options = {key: int(value) if value.isdigit() else (float(value) if value[0].isdigit() else value) for

@@ -266,7 +266,7 @@ class ITSA:
             G_target_s = self.ts_.inverse_transform(mu_unstd)[0]
 
             W_s = invsqrtm(Cbar_rec_s) @ sqrtm(G_target_s)
-            self.A_filters_[s] = to_spd_np(self.M_inv_sqrt_[s] @ W_s)
+            self.A_filters_[s] = self.M_inv_sqrt_[s] @ W_s
 
         self._filters_cache.clear()  # Limpiamos caché GPU
         return self
@@ -382,8 +382,7 @@ class ITSA:
                 Minv = np.eye(W_s.shape[0])
             A_s = Minv @ W_s
 
-            # Estabilización numérica (nota: esto impone simetría/SPD)
-            self.A_filters_[s] = to_spd_np(A_s)
+            self.A_filters_[s] = A_s
 
     @torch.no_grad()
     def transform_signals(self, x: torch.Tensor, subjects: torch.Tensor) -> torch.Tensor:
