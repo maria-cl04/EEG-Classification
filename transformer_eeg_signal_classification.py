@@ -165,7 +165,11 @@ loaders = {split: DataLoader(Splitter(dataset, split_path=opt.splits_path, split
            ["train", "val", "test"]}
 if not opt.itsa_off:
     if opt.pretrained_itsa != '':
-        itsa = torch.load(opt.pretrained_itsa)
+        # 1. Cargamos el objeto ITSA core (la versión "ligera")
+        loaded_itsa_core = torch.load(opt.pretrained_itsa, weights_only=False)
+        # 2. Lo volvemos a envolver en el Integrator
+        itsa = ITSAIntegrator(loaded_itsa_core)
+        # 3. ¡Ahora sí podemos llamar a adapt_from_dataset!
         itsa.adapt_from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
     else:
         itsa = ITSAIntegrator.from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
