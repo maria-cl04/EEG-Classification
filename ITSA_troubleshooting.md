@@ -45,17 +45,17 @@ def export_light(self):
         mean_maxiter=self.mean_maxiter,
         unit_trace_per_subject=self.unit_trace_per_subject
     )
-    # Conservamos lo imprescindible
+    # Keep only the essentials
     lite.ts_ = self.ts_
     lite.scaler_ = self.scaler_
     lite.mu_global_ = {int(k): v.astype(np.float32) for k, v in self.mu_global_.items()}
 
-    # Eliminamos/compactamos el resto
-    lite.reference_G_ = self.reference_G_  # (C,C), puedes castear a float32 si quieres
-    lite.M_inv_sqrt_ = {}  # no necesitamos las de sujetos base
-    lite.Rs_ = {}  # enorme → fuera
-    lite.A_filters_ = None  # se derivan en la adaptación al destino
-    lite._filters_cache = {}  # limpio
+    # Remove/compact the rest
+    lite.reference_G_ = self.reference_G_  # (C,C), can cast to float32 if desired
+    lite.M_inv_sqrt_ = {}  # base subjects' not needed
+    lite.Rs_ = {}  # huge -> drop
+    lite.A_filters_ = None  # derived during target adaptation
+    lite._filters_cache = {}  # clean
     return lite
 ```
 
@@ -75,7 +75,6 @@ $$x \mapsto x\,A_s$$
 That aligns domains but does **not** provide *augmentation*: the model sees **one** ITSA-view of each trial, with no diversity -> small or inconsistent gains.
 
 ### Fix: Treat ITSA as **real augmentation** in train, and keep it **deterministic** in val/test
-
 - **Train:** blend between **identity** and **alignment** using a geodesic‑style interpolation.
 - **Val/Test:** apply **pure $A_s$** (deterministic), so evaluation is stable and consistent with deployment.
 
@@ -92,7 +91,7 @@ This section explains the augmentation logic implemented **inside** `ITSA.py` (n
 
 **The parameters you set in the main loop:**
 * `alpha_range=(0.5, 0.95)`: The interval $(a, b)$ from which $\alpha$ is sampled when `mode="augment"`. Lower $a \Rightarrow$ more identity‑like views (weaker alignment, more diversity). Higher $b \Rightarrow$ more alignment‑like views (stronger domain adaptation). In practice, `(0.5, 0.95)` makes most augmented views noticeably aligned but not all the way to $A_s$, which tends to improve robustness without collapsing variability.
-* `jitter_sigma`: (Deprecated - see section 2.2). Previously added a very small perturbation in the covariance eigen‑spectrum of the transformed signal. 
+* `jitter_sigma`: (Deprecated - see section 2.2 and 5). Previously added a very small perturbation in the covariance eigen‑spectrum of the transformed signal. 
 
 **Helper functions and safety guards (inside `ITSA.py`):**
 * **Blending $I \leftrightarrow A_s$** (`_blend_filter`): Implements $A_\alpha = \exp(\alpha \log(A_s))$ using eigendecomposition. Adds SPD *safety floors* to eigenvalues to avoid negative/zero eigenvalues that would break `log/exp`.
@@ -102,23 +101,18 @@ This section explains the augmentation logic implemented **inside** `ITSA.py` (n
 * **Caching**: The per‑subject filter $A$ is moved once to the current device/dtype and cached. This avoids re‑allocations and speeds up batches.
 
 ### 2.2 Deprecating `jitter_sigma` (why and how the code changed)
-We initially added `jitter_sigma` to inject tiny **SPD‑preserving spectral perturbations** during training:
-$$C \mapsto C_j \quad \text{with} \quad \lambda_j = \lambda \cdot (1 + \varepsilon), \;\varepsilon \sim \mathcal{N}(0,\sigma^2)$$
-and then $X \mapsto X \, C^{-1/2} C_j^{1/2}$. In practice, on this project it led to occasional numerical instabilities (NaNs) unless we used large eigenvalue floors, noticeable runtime overhead, and no clear benefit over the simpler blending.
+We initially added `jitter_sigma` to inject tiny **SPD‑preserving spectral perturbations** during training. In practice, on this project it led to occasional numerical instabilities (NaNs) unless we used large eigenvalue floors, noticeable runtime overhead, and no clear benefit over the simpler blending.
+
+*(Note: While I initially did a soft-remove to avoid breaking APIs, I eventually performed a complete hard-remove to reduce technical debt. See Section 5 for the final implementation details).*
 
 With `jitter_sigma=0.0`, training was stable and fast, and the augmentation from the geodesic blend already provided the desired variability. Therefore, jitter is **deprecated** here.
-
-**What changed in `ITSA.py` (Two-step deprecation):**
-1.  **Soft‑remove (non‑breaking):** Keep the argument in function signatures so training scripts don’t need edits. Remove the internal jitter block and add a comment: `# jitter disabled (no-op)`.
-2.  **Hard‑remove (optional, later):** Drop `jitter_sigma` from the signatures and delete all jitter‑related helpers yielding a cleaner API.
 
 **Current recommended usage:**
 * **Train (augment):** `mode="augment", alpha_range=(0.5, 0.95)`
 * **Val/Test (deterministic):** `mode="deterministic"`
-* `jitter_sigma` is **unused** in this repository.
 
 ### 2.3 Driver (main loop) change
-I added an `--itsa_off` flag and applied augmentation only in the training split (passing the deprecated jitter for API compatibility only):
+I added an `--itsa_off` flag and applied augmentation only in the training split:
 
 ```python
 for i, (input, target, batch_subjects) in enumerate(loaders[split]):
@@ -134,8 +128,7 @@ for i, (input, target, batch_subjects) in enumerate(loaders[split]):
             input = itsa.transform_batch(
                 input, batch_subjects,
                 mode="augment",
-                alpha_range=(0.5, 0.95),
-                jitter_sigma=0.015  # NOTE: Now a no-op internally
+                alpha_range=(0.5, 0.95)
             )
         else:
             input = itsa.transform_batch(
@@ -156,6 +149,7 @@ for i, (input, target, batch_subjects) in enumerate(loaders[split]):
 - Result: calling `itsa.transform_batch(..., mode="augment", ...)` reached an older path that **didn’t accept** those kwargs.
 
 ### Fix: Update both the class method and the integrator wrapper
+
 - In **`ITSA`** (class), ensure the signature includes the new parameters:
 
 ```python
@@ -166,8 +160,7 @@ class ITSA:
         x: torch.Tensor,
         subjects: torch.Tensor,
         mode: str = "deterministic",  # "augment" | "deterministic"
-        alpha_range=(1.0, 1.0),  # si augment: mezcla I↔A_s, p.ej. (0.5, 0.95)
-        jitter_sigma: float = 0.0  # (Deprecated) jitter SPD opcional
+        alpha_range=(1.0, 1.0)  # if augment: blends I↔A_s, e.g., (0.5, 0.95)
     ) -> torch.Tensor:
         ...
 ```
@@ -175,20 +168,18 @@ class ITSA:
 
 ```python
 class ITSAIntegrator:
-    @_torch.no_grad()
-    def transform_batch(self, x: _torch.Tensor, subjects: _torch.Tensor,
+    @torch.no_grad()
+    def transform_batch(self, x: torch.Tensor, subjects: torch.Tensor,
                         mode: str = "deterministic",
-                        alpha_range=(1.0, 1.0),
-                        jitter_sigma: float = 0.0) -> _torch.Tensor:
+                        alpha_range=(1.0, 1.0)) -> torch.Tensor:
         """
-        Aplica ITSA por sujeto. Conserva la forma de x:
+        Applies ITSA per subject. Preserves x shape:
         - (B,T,C) -> (B,T,C)
         - (B,1,C,T) -> (B,1,C,T)
         """
         return self._itsa.transform_signals(x, subjects,
                                             mode=mode,
-                                            alpha_range=alpha_range,
-                                            jitter_sigma=jitter_sigma)
+                                            alpha_range=alpha_range)
 ```
 
 ---
@@ -216,7 +207,7 @@ C = cov_from_signal_torch(eeg2d.double(), eps=1e-4).cpu().numpy()  # (C,C) SPD
 
 ## 5. Problem: Jitter Augmentation Caused NaNs and Bloated the Code (The "Hard-Remove")
 
-### Why it happened (The Issue)
+### Why it happened
 Initially, `jitter_sigma` was implemented as a secondary augmentation strategy during training. The idea was to inject tiny, SPD-preserving spectral perturbations into the covariance matrices to make the model more robust. 
 
 However, in practice, this approach introduced several critical issues:
@@ -224,10 +215,9 @@ However, in practice, this approach introduced several critical issues:
 2.  **High Computational Overhead:** It required additional, expensive eigendecompositions (`invsqrtm`, `sqrtm`) on the fly, significantly slowing down the training loop.
 3.  **Lack of Empirical Benefit:** The geodesic blending (`alpha_range=(0.5, 0.95)`) already provided sufficient and stable data augmentation. The jitter did not improve the final classification results.
 
-### The Decision: "Hard-Remove" vs "Soft-Remove"
+### Fix
 Initially, the idea was to "soft-remove" the jitter (leaving the arguments in the functions but disabling the internal logic). However, `ITSA.py` is a core file with over 600 lines of code. Keeping "zombie code" (dead arguments, unused helper functions, and commented-out logic blocks) only adds technical debt, reduces readability, and creates confusion for future maintenance. Therefore, a **complete removal (hard-remove)** was the cleanest and most professional solution.
 
-### How it was fixed (The Solution)
 I completely stripped out all jitter-related logic across the pipeline to streamline the augmentation process:
 
 * **In `ITSA.py` (Main Class):**
@@ -249,7 +239,9 @@ input = itsa.transform_batch(
     alpha_range=(0.5, 0.95)
 )
 ```
+
 ---
+
 ## 6. Problem: Silent Caching Bug and CPU Bottleneck in Augmentation
 
 ### Why it happened
@@ -261,7 +253,6 @@ While reviewing the geodesic augmentation in `ITSA.transform_signals(...)`, I di
    The `_blend_filter` helper was using NumPy (`np.linalg.eigh`), which runs on the CPU. Inside the training loop, the code was constantly pulling tensors to the CPU, performing complex eigendecompositions, and pushing them back to the GPU (`to(device=device)`). This broke parallelism and starved the GPU.
 
 ### Fix: Native PyTorch Blending and Correct Cache Targeting
-
 **1. Fix the Cache Logic:**
 I modified the caching mechanism to store *only* the deterministic base spatial filter ($A_s$) on the GPU. The stochastic interpolation is now applied *on the fly* during every forward pass without overwriting the cached base filter.
 
@@ -345,7 +336,9 @@ I rewrote the blending helper to use native PyTorch operations (`torch.linalg.ei
             return Xout.squeeze(0)
         return Xout
 ```
+
 ---
+
 ## 7. Code Cleanup: Removing Technical Debt in `ITSA.py`
 
 ### Why it happened
@@ -382,7 +375,9 @@ Instead of patching dictionaries one by one, I added a robust initialization blo
         for s in np.unique(subjects_np):
             # ... adaptation loop continues ...
 ```
+
 ---
+
 ## 9. Future-Proofing ITSA Reusability (Skipping the 1-Hour Base Calculation)
 
 ### Why it happened
@@ -428,13 +423,13 @@ if not opt.itsa_off:
         
         # 2. Check if we need to adapt or just load
         if opt.adapt_new_subject:
-            print("Adaptando espacio ITSA al nuevo sujeto...")
+            print("Adapting ITSA space to new subject...")
             itsa.adapt_from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
         else:
-            print("Cargando filtros ITSA base (sin adaptar)...")
+            print("Loading base ITSA filters (without adapting)...")
             
     else:
-        print("Calculando espacio ITSA desde cero (¡paciencia!)...")
+        print("Computing ITSA space from scratch (please wait!)...")
         itsa = ITSAIntegrator.from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
         itsa_lite = itsa._itsa.export_light()
         torch.save(itsa_lite, 'itsa_pretrained_space_light.pth')
@@ -443,7 +438,9 @@ if not opt.itsa_off:
 ### Usage for future experiments:
 * **To retrain the base model quickly:** `--pretrained_itsa itsa_pretrained_space_light.pth`
 * **To fine-tune on a new target subject:** `--pretrained_itsa itsa_pretrained_space_light.pth --adapt_new_subject`
+
 ---
+
 ## 10. Problem: Catastrophic Forgetting During Fine-Tuning (ITSA Performance Collapse)
 
 ### Why it happened
@@ -472,12 +469,17 @@ alpha_range = (1.0, 1.0)
 # The optimizer should still use weight decay to prevent overfitting on the small target dataset
 optimizer = torch.optim.Adam(model.parameters(), lr=opt.learning_rate, weight_decay=1e-4)
 ```
+
 ---
 
 ## Summary
 
-* **Space issue:** Solved with `export_light()` (keep `ts_`, `scaler_`, `mu_global_`, `reference_G_`; drop heavy fields).  
+* **Space issue:** Solved with `export_light()` (keep `ts_`, `scaler_`, `mu_global_`, `reference_G_`, and `A_filters_`; drop heavy fields).  
 * **No improvement with ITSA:** Fixed by using ITSA as *augmentation* in **train** (geodesic interpolation between Identity and $A_s$) and **deterministic** in **val/test**. 
-* **Jitter overhead/NaNs:** Deprecated `jitter_sigma`, relying entirely on the geodesic interpolation for augmentation stability.
-* **Partial implementation:** Fixed by updating **both** `ITSA.transform_signals(...)` **and** `ITSAIntegrator.transform_batch(...)` to accept/forward `mode`, `alpha_range`, `jitter_sigma`.  
-* **Stability & cleanliness:** Removed redundant SPD projections when building $A_s$; computed covariances in double precision with `eps`; centralized the ITSA calls in the main loop.
+* **Jitter overhead/NaNs:** Deprecated and completely hard-removed `jitter_sigma`, relying entirely on the geodesic interpolation for augmentation stability.
+* **Partial implementation:** Fixed by updating **both** `ITSA.transform_signals(...)` **and** `ITSAIntegrator.transform_batch(...)` to accept/forward `mode` and `alpha_range`.  
+* **Stability & code cleanliness:** Removed redundant SPD projections when building $A_s$; computed covariances in double precision with `eps`; centralized the ITSA calls; and removed dead ML legacy code (e.g., SVM feature extraction) to reduce technical debt.
+* **Caching bug & CPU bottleneck:** Solved by caching *only* the deterministic base spatial filter on the GPU and rewriting the stochastic blending to run natively on the GPU on the fly.
+* **Hidden "NoneType" errors:** Prevented crashes from outdated light exports by adding a robust initialization block ("None-shield") at the start of `adapt_subject`.
+* **Reusability & Recalculation overhead:** Kept `A_filters_` in the light export and added an `--adapt_new_subject` flag to allow loading base filters directly, avoiding a 1-hour recalculation.
+* **Catastrophic Forgetting during fine-tuning:** Fixed the performance collapse on new target subjects by treating fine-tuning delicately: lowering the learning rate (e.g., 1e-4) and disabling structural geodesic noise (`alpha_range=(1.0, 1.0)`).
