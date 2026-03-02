@@ -145,6 +145,12 @@ class ITSA:
         for i, (C, s) in enumerate(zip(covs, subjects)):
             s = int(s)
             Cc = to_spd_np(C, eps=self.subject_eps)
+
+            # normalize trace before recentering (= before applying the corrector)
+            if self.unit_trace_per_subject:
+                tr = np.trace(Cc)
+                Cc = Cc / max(tr, 1e-12)
+
             Minv = self.M_inv_sqrt_[s]
             out[i] = to_spd_np(Minv @ Cc @ Minv, eps=self.subject_eps)
         return out
@@ -431,7 +437,8 @@ class ITSA:
                 A_t = A_base
 
             # 3. Aplicar el filtro: (T,C) @ (C,C) -> (T,C)
-            xb = x_[b].to(torch.float32) @ A_t
+
+            xb = x_[b].to(torch.float32) @ A_t.T
             out.append(xb)
 
         Xout = torch.stack(out, dim=0)

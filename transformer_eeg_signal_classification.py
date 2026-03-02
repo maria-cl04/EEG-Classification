@@ -203,6 +203,17 @@ if not opt.no_cuda:
 if opt.pretrained_net != '':
     model = torch.load(opt.pretrained_net, weights_only=False)
 
+    # ✅ ADD THIS: freeze all layers first
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # ✅ Then unfreeze only the last classification layer
+    # (adjust 'classifier' to whatever your final layer is named)
+    for name, param in model.named_parameters():
+        if 'classifier' in name or 'fc' in name or 'out' in name:
+            param.requires_grad = True
+            print(f"Unfrozen: {name}")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=opt.learning_rate)  # nuevo LR
     # Learning rate scheduler (equivalente al learning_rate_decay_by para Adam)
     scheduler = torch.optim.lr_scheduler.StepLR(
