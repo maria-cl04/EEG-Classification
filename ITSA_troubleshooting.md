@@ -472,6 +472,97 @@ optimizer = torch.optim.Adam(model.parameters(), lr=opt.learning_rate, weight_de
 
 ---
 
+## 11. Bug: Trace Normalization Applied Inconsistently Between Fit and Transform
+
+### Why it happened
+In the `_fit_subject_means` method, before computing each subject's "average EEG pattern" (their Riemannian mean `M`), the code optionally normalizes each covariance matrix so they all have the same overall scale. This is controlled by the `unit_trace_per_subject` flag and is done by dividing each matrix by its **trace** (a measure of its total "energy"):
+
+```python
+# Inside _fit_subject_means (what happens during FIT):
+if self.unit_trace_per_subject:
+    tr = np.trace(covs_s_tr, axis1=1, axis2=2).reshape(-1, 1, 1)
+    covs_s_tr = covs_s_tr / np.maximum(tr, 1e-12)  # normalize first
+M = mean_riemann(covs_s_tr, ...)                    # then compute mean
+self.M_inv_sqrt_[s] = invsqrtm(M)                  # corrector built from normalized data
+```
+
+So the corrector `M_inv_sqrt_[s]` was computed from **trace-normalized** matrices. However, in `_apply_subject_recentering_np` — the method that actually *uses* that corrector — the normalization step was missing. It applied the corrector directly to the **raw, un-normalized** matrices:
+
+```python
+# Inside _apply_subject_recentering_np (what happened during TRANSFORM - WRONG):
+Cc = to_spd_np(C, eps=self.subject_eps)  # raw matrix, NOT normalized
+Minv = self.M_inv_sqrt_[s]
+out[i] = to_spd_np(Minv @ Cc @ Minv, ...)  # applying a corrector built for normalized data
+                                             # to un-normalized data → wrong result
+```
+
+This is mathematically equivalent to calibrating a scale using kilograms, then using it to weigh objects measured in pounds. The corrector was built for one "unit system" but applied to another, producing a subtly wrong alignment for every single sample.
+
+### Fix
+Added the trace normalization step inside `_apply_subject_recentering_np`, **before** applying the corrector, so that the data is in the same "unit system" that `M_inv_sqrt_[s]` was built from:
+
+```python
+def _apply_subject_recentering_np(self, covs: np.ndarray, subjects: np.ndarray) -> np.ndarray:
+    out = np.empty_like(covs)
+    for i, (C, s) in enumerate(zip(covs, subjects)):
+        s = int(s)
+        Cc = to_spd_np(C, eps=self.subject_eps)
+
+        # ✅ FIX: normalize trace BEFORE applying the corrector,
+        # to match the scale used when M_inv_sqrt_[s] was computed in _fit_subject_means
+        if self.unit_trace_per_subject:
+            tr = np.trace(Cc)
+            Cc = Cc / max(tr, 1e-12)
+
+        Minv = self.M_inv_sqrt_[s]
+        out[i] = to_spd_np(Minv @ Cc @ Minv, eps=self.subject_eps)
+    return out
+```
+
+The same logic applies inside `adapt_subject`, where the normalization was already present in the new-subject loop — so no changes were needed there.
+
+---
+
+## 12. Bug: Spatial Filter Applied Transposed, Corrupting All Aligned Signals
+
+### Why it happened
+This was the most impactful bug in the pipeline, and most likely the primary cause of accuracy being stuck at ~0.36 (near-random for 40 classes).
+
+The spatial filter `A_s` is a `(C, C)` matrix — a learned mixing of the 128 EEG channels. The EEG data has shape `(T, C)`, where T is time and C is channels. Each row is one moment in time, each column is one channel.
+
+In standard linear algebra, applying a spatial filter to row-major signal data `(T, C)` via right-multiplication requires **transposing** the filter:
+
+$$X_{\text{aligned}} = X \cdot A_s^{\top}$$
+
+This is because `A_s` is designed to act on **column vectors** (one full channel vector at a time). When the data is stored as rows instead, the transpose is needed to keep the channel-mixing oriented correctly.
+
+The original code in `transform_signals` was doing:
+
+```python
+# WRONG: applying A_t directly without transposing
+xb = x_[b].to(torch.float32) @ A_t
+```
+
+This is equivalent to applying `A_s^{\top}` instead of `A_s`. Since `A_s` is **not symmetric** (it is a composition of several non-symmetric matrices — `invsqrtm`, `sqrtm`, and a Procrustes rotation `R`), its transpose is a completely different transformation. Instead of aligning the subject's EEG toward the reference space, the code was applying an unintended distortion to every sample, for every subject, every batch, across the entire training run.
+
+### Fix
+Added `.T` (transpose) to the filter before applying it, on the relevant line inside `transform_signals`:
+
+```python
+# ✅ FIX: transpose A_t so the filter is applied in the correct orientation
+xb = x_[b].to(torch.float32) @ A_t.T
+```
+
+This single character change ensures the spatial filter acts as mathematically intended — mixing channels to remove each subject's personal bias and align their signals toward the learned reference space.
+
+### Why this caused ~0.36 accuracy
+With the filter transposed, the "alignment" was actively moving each subject's data in the **wrong direction** in feature space — making signals from different subjects *more* different rather than less. The transformer model was then trying to learn classification on top of consistently corrupted inputs, which explains why:
+- Training loss stayed high (the model could not find a good mapping)
+- Accuracy hovered near chance (0.36 ≈ near 1/40, with some structure from the corruption being accidentally learnable)
+- ITSA appeared to perform worse than no alignment at all
+
+---
+
 ## Summary
 
 * **Space issue:** Solved with `export_light()` (keep `ts_`, `scaler_`, `mu_global_`, `reference_G_`, and `A_filters_`; drop heavy fields).  
