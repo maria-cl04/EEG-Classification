@@ -443,7 +443,35 @@ if not opt.itsa_off:
 ### Usage for future experiments:
 * **To retrain the base model quickly:** `--pretrained_itsa itsa_pretrained_space_light.pth`
 * **To fine-tune on a new target subject:** `--pretrained_itsa itsa_pretrained_space_light.pth --adapt_new_subject`
+---
+## 10. Problem: Catastrophic Forgetting During Fine-Tuning (ITSA Performance Collapse)
 
+### Why it happened
+When attempting to evaluate the pre-trained ITSA Transformer on a new unseen subject (Target Subject), the model's performance collapsed completely. The Training Loss started at ~8.69 (much worse than random chance for 40 classes, which is ~3.68), and the Accuracy stagnated around 5-8%, performing significantly worse than a baseline model trained from scratch without ITSA (which achieved ~43%).
+
+This was caused by the **"fair comparison fallacy"** in Transfer Learning. I kept the exact same hyperparameters for fine-tuning as I did for training from scratch:
+1. **Learning Rate (`0.001`):** A high learning rate is necessary when training from scratch, but applying it to a pre-trained model acts as a sledgehammer. The optimizer saw the initial domain shift of the new subject, took a massive gradient step, and completely destroyed the optimal attention weights (the understanding of the Riemannian space) learned during the 200 pre-training epochs. This is a textbook case of **Catastrophic Forgetting**.
+2. **Aggressive Geodesic Augmentation (`alpha_range=(0.5, 0.95)`):** While excellent for regularizing the base model across 5 subjects, applying heavy structural noise during fine-tuning—where the target subject's data is very limited—prevented the network from securely mapping the new subject's features.
+
+### Fix
+To perform a true and effective fine-tuning, the hyperparameters must be adapted to gently update the network without destroying its prior knowledge. 
+
+1. **The Scalpel Approach (Lower Learning Rate):** Dropped the Learning Rate by an order of magnitude (from `1e-3` to `1e-4` or `5e-5`). This ensures the optimizer only makes microscopic adjustments to the classifier head while preserving the deep spatial feature extractors.
+2. **Disable Structural Noise (Deterministic Augmentation):** Changed `alpha_range` to `(1.0, 1.0)` during fine-tuning. Since the ITSA space is already aligned, the model just needs to learn the subject-specific mapping without dealing with random geodesic distortions.
+
+**Updated Configuration for Fine-Tuning (`transformer_eeg_signal_classification.py`):**
+```python
+# When running the fine-tuning script with --pretrained_net and --adapt_new_subject:
+
+# 1. Lower Learning Rate specifically for fine-tuning
+opt.learning_rate = 1e-4  # or 5e-5
+
+# 2. Turn off Geodesic Augmentation to let the model converge quickly on the new subject
+alpha_range = (1.0, 1.0)
+
+# The optimizer should still use weight decay to prevent overfitting on the small target dataset
+optimizer = torch.optim.Adam(model.parameters(), lr=opt.learning_rate, weight_decay=1e-4)
+```
 ---
 
 ## Summary
