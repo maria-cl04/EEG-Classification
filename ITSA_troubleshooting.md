@@ -446,25 +446,25 @@ if not opt.itsa_off:
 ### Why it happened
 When attempting to evaluate the pre-trained ITSA Transformer on a new unseen subject (Target Subject), the model's performance collapsed completely. The Training Loss started at ~8.69 (much worse than random chance for 40 classes, which is ~3.68), and the Accuracy stagnated around 5-8%, performing significantly worse than a baseline model trained from scratch without ITSA (which achieved ~43%).
 
-This was caused by the **"fair comparison fallacy"** in Transfer Learning. I kept the exact same hyperparameters for fine-tuning as I did for training from scratch:
-1. **Learning Rate (`0.001`):** A high learning rate is necessary when training from scratch, but applying it to a pre-trained model acts as a sledgehammer. The optimizer saw the initial domain shift of the new subject, took a massive gradient step, and completely destroyed the optimal attention weights (the understanding of the Riemannian space) learned during the 200 pre-training epochs. This is a textbook case of **Catastrophic Forgetting**.
-2. **Aggressive Geodesic Augmentation (`alpha_range=(0.5, 0.95)`):** While excellent for regularizing the base model across 5 subjects, applying heavy structural noise during fine-tuning—where the target subject's data is very limited—prevented the network from securely mapping the new subject's features.
+This was caused by the **"fair comparison fallacy"** in Transfer Learning. I kept the exact same learning rate for fine-tuning as I did for training from scratch (`0.001`). A high learning rate is necessary when training from scratch, but applying it to a pre-trained model acts as a sledgehammer. The optimizer saw the initial domain shift of the new subject, took a massive gradient step, and completely destroyed the optimal attention weights (the understanding of the Riemannian space) learned during the 200 pre-training epochs. This is a textbook case of **Catastrophic Forgetting**.
 
 ### Fix
 To perform a true and effective fine-tuning, the hyperparameters must be adapted to gently update the network without destroying its prior knowledge. 
 
-1. **The Scalpel Approach (Lower Learning Rate):** Dropped the Learning Rate by an order of magnitude (from `1e-3` to `1e-4` or `5e-5`). This ensures the optimizer only makes microscopic adjustments to the classifier head while preserving the deep spatial feature extractors.
-2. **Disable Structural Noise (Deterministic Augmentation):** Changed `alpha_range` to `(1.0, 1.0)` during fine-tuning. Since the ITSA space is already aligned, the model just needs to learn the subject-specific mapping without dealing with random geodesic distortions.
+**The Scalpel Approach (Lower Learning Rate):** I dropped the Learning Rate by an order of magnitude (from `1e-3` to `1e-4`). This ensures the optimizer only makes microscopic adjustments to the classifier head while preserving the deep spatial feature extractors. 
+
+*Note:* The Geodesic Augmentation (`alpha_range=(0.5, 0.95)`) used during pre-training is **kept active** during fine-tuning. This structural noise acts as an excellent regularizer, preventing the model from overfitting on the very limited data of the single target subject, while val/test remain deterministic.
 
 **Updated Configuration for Fine-Tuning (`transformer_eeg_signal_classification.py`):**
 ```python
 # When running the fine-tuning script with --pretrained_net and --adapt_new_subject:
 
 # 1. Lower Learning Rate specifically for fine-tuning
-opt.learning_rate = 1e-4  # or 5e-5
+opt.learning_rate = 1e-4  
 
-# 2. Turn off Geodesic Augmentation to let the model converge quickly on the new subject
-alpha_range = (1.0, 1.0)
+# 2. Keep Geodesic Augmentation for training, deterministic for val/test
+# (Same as pre-training conditions)
+alpha_range = (0.5, 0.95)
 
 # The optimizer should still use weight decay to prevent overfitting on the small target dataset
 optimizer = torch.optim.Adam(model.parameters(), lr=opt.learning_rate, weight_decay=1e-4)
@@ -573,4 +573,6 @@ With the filter transposed, the "alignment" was actively moving each subject's d
 * **Caching bug & CPU bottleneck:** Solved by caching *only* the deterministic base spatial filter on the GPU and rewriting the stochastic blending to run natively on the GPU on the fly.
 * **Hidden "NoneType" errors:** Prevented crashes from outdated light exports by adding a robust initialization block ("None-shield") at the start of `adapt_subject`.
 * **Reusability & Recalculation overhead:** Kept `A_filters_` in the light export and added an `--adapt_new_subject` flag to allow loading base filters directly, avoiding a 1-hour recalculation.
-* **Catastrophic Forgetting during fine-tuning:** Fixed the performance collapse on new target subjects by treating fine-tuning delicately: lowering the learning rate (e.g., 1e-4) and disabling structural geodesic noise (`alpha_range=(1.0, 1.0)`).
+* **Catastrophic Forgetting during fine-tuning:** Fixed the performance collapse on new target subjects by lowering the learning rate (e.g., `1e-4`) to gently update weights, while keeping the training geodesic augmentation (`alpha_range=(0.5, 0.95)`) to prevent overfitting.
+* **Trace Normalization Bug:** Fixed an inconsistent alignment scale by ensuring that input matrices are trace-normalized during transformation, matching the mathematical constraints used during the fitting phase.
+* **Spatial Filter Transpose Bug:** Fixed near-random accuracy (~0.36) by properly transposing the spatial filter ($A_s^\top$) when right-multiplying row-major signal tensors $(T, C)$, preventing the model from corrupting the channel mixing.
