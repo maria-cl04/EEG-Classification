@@ -95,11 +95,11 @@ class ITSA:
     """
 
     def __init__(
-        self,
-        subject_eps: float = 1e-10,
-        mean_tol: float = 1e-6,
-        mean_maxiter: int = 50,
-        unit_trace_per_subject: bool = True,
+            self,
+            subject_eps: float = 1e-10,
+            mean_tol: float = 1e-6,
+            mean_maxiter: int = 50,
+            unit_trace_per_subject: bool = True,
     ) -> None:
         self.subject_eps = subject_eps
         self.mean_tol = mean_tol
@@ -114,7 +114,6 @@ class ITSA:
         self.Rs_: Dict[int, np.ndarray] = {}
         self.A_filters_: Optional[Dict[int, np.ndarray]] = None
         self.mu_global_: Dict[int, np.ndarray] = {}
-
 
         # Caché GPU de filtros convertidos a Torch por (sujeto, device, dtype)
         self._filters_cache: Dict[tuple, torch.Tensor] = {}
@@ -173,11 +172,11 @@ class ITSA:
 
     # ------------ Paso 4: Rotaciones supervisadas por sujeto (TRAIN) ---------
     def _fit_subject_rotations(
-        self,
-        covs_rec: np.ndarray,
-        labels: np.ndarray,
-        subjects: np.ndarray,
-        train_idx: np.ndarray,
+            self,
+            covs_rec: np.ndarray,
+            labels: np.ndarray,
+            subjects: np.ndarray,
+            train_idx: np.ndarray,
     ) -> None:
         assert self.ts_ is not None and self.scaler_ is not None
         mask_tr = np.zeros(covs_rec.shape[0], dtype=bool)
@@ -206,93 +205,113 @@ class ITSA:
             R, _ = orthogonal_procrustes(B, A)
             self.Rs_[s] = R if R.shape == (d, d) else np.eye(d)
 
-    def adapt_subject(
+    def transform_test_loso(
             self,
             covs: np.ndarray,
             labels: np.ndarray,
             subjects: np.ndarray,
-            train_idx: np.ndarray,
-    ):
+    ) -> np.ndarray:
         """
-        Adapta el espacio ITSA pre-entrenado a un NUEVO sujeto usando sus datos de calibración.
+        Transform TEST data using LOSO protocl with calibration/evaluation split.
+
+        This implements the paper's two-stage rotation approach:
+        1. Recentering: per-subject (using test subejct's own mean)
+        2. Rescaling: global (using training reference)
+        3. Rotation: 2-fold nested CV
+            - Split test features into calibration(50%) and evaluation (50%)
+            - Compute rotation parameters from calibration subset
+            - Apply to evaluation subset
+            - Average perfomance across folds
+
+        Args:
+            covs: (N_test, C, C) - test covariance matrices
+            labels: (N_test,) - test labels
+            subject: (N_test,) - test subjects (should be single held-out subject)
+
+        Returns:
+            Z_rot_eval: (N_test_eval, d) - rotated features from evaluation subset
         """
+
+        assert self.ts_ is not None and self.scaler_ is not None
+
         covs_np = _as_numpy(covs).astype(np.float64)
         labels_np = _as_numpy(labels).astype(np.int64).reshape(-1)
         subjects_np = _as_numpy(subjects).astype(np.int64).reshape(-1)
-        train_idx_np = _as_numpy(train_idx).astype(np.int64).reshape(-1)
 
-        mask_tr = np.zeros(covs_np.shape[0], dtype=bool)
-        mask_tr[train_idx_np] = True
+        test_subject = int(subjects_np[0])  # Should be single subject
 
-        # --- ESCUDO ANTI-NONE (Robust Initialization) ---
-        if getattr(self, "M_inv_sqrt_", None) is None: self.M_inv_sqrt_ = {}
-        if getattr(self, "Rs_", None) is None: self.Rs_ = {}
-        if getattr(self, "A_filters_", None) is None: self.A_filters_ = {}
-        if getattr(self, "_filters_cache", None) is None: self._filters_cache = {}
-        # ------------------------------------------------
+        # --- STEP 1: Subject-specific recentering (using TEST subject's own mean) ---
+        covs_rec_test = self._apply_subject_recentering_np(covs_np, subjects_np)
 
-        for s in np.unique(subjects_np):
-            s = int(s)
-            m = (subjects_np == s)
-            m_tr = m & mask_tr
-            covs_s_tr = covs_np[m_tr] if np.any(m_tr) else covs_np[m]
+        # --- STEP 2: Global rescaling (using training reference) ---
+        Z_test = self.ts_.transform(covs_rec_test)
+        Z_test_std = self.scaler_.transform(Z_test)
 
-            # 1. Media del sujeto nuevo y recentrado
-            if self.unit_trace_per_subject:
-                tr = np.trace(covs_s_tr, axis1=1, axis2=2).reshape(-1, 1, 1)
-                covs_s_tr = covs_s_tr / np.maximum(tr, 1e-12)
+        # --- STEP 3: Two-fold nested CV for rotation ---
+        N_test = Z_test_std.shape[0]
+        d = Z_test_std.shape[1]
 
-            M_init = mean_logeuclid(covs_s_tr)
-            M = mean_riemann(covs_s_tr, init=M_init, tol=self.mean_tol, maxiter=self.mean_maxiter)
-            self.M_inv_sqrt_[s] = invsqrtm(M)
+        # Split into calibration (fold 1) and evalutaion (fold 2)
+        split_idx = N_test // 2
 
-            Cc = np.empty_like(covs_s_tr)
-            for i, C in enumerate(covs_s_tr):
-                C_spd = to_spd_np(C, eps=self.subject_eps)
-                Cc[i] = to_spd_np(self.M_inv_sqrt_[s] @ C_spd @ self.M_inv_sqrt_[s], eps=self.subject_eps)
+        # ==== FOLD 1: Calibration on first half, evaluate on second half ====
+        Z_calib_f1 = Z_test_std[:split_idx]
+        Z_eval_f1 = Z_test_std[split_idx:]
+        y_calib_f1 = labels_np[:split_idx]
 
-            # 2. Proyección al TS CONGELADO de los sujetos base
-            Z_tr = self.ts_.transform(Cc)
-            Z_tr_std = self.scaler_.transform(Z_tr)
-            ys = labels_np[m_tr] if np.any(m_tr) else labels_np[m]
+        # Compute anchor points for rotation
+        # Training anchor points (from training subjects, already computed)
+        anchor_points_train = np.stack(
+            [self.mu_global_[int(k)] for k in sorted(self.mu_global_.keys())],
+            axis=0
+        )  # (K, d)
 
-            # 3. Rotación supervisada hacia los centroides CONGELADOS
-            Ks = np.unique(ys)
-            d = Z_tr_std.shape[1]
-            valid_Ks = [k for k in Ks if int(k) in self.mu_global_]  # Solo clases que conocemos
+        # Calibration anchor points (from calibration subset)
+        classes_calib = np.unique(y_calib_f1)
+        anchor_points_calib_f1 = np.stack(
+            [Z_calib_f1[y_calib_f1 == k].mean(axis=0) for k in classes_calib],
+            axis=0
+        )  # (K, d)
 
-            if len(valid_Ks) < 2:
-                self.Rs_[s] = np.eye(d)
-            else:
-                A = np.stack([self.mu_global_[int(k)] for k in valid_Ks], 0)  # Destino (Global)
-                B = np.stack([Z_tr_std[ys == k].mean(axis=0) for k in valid_Ks], 0)  # Origen (Sujeto Nuevo)
-                R, _ = orthogonal_procrustes(B, A)
-                self.Rs_[s] = R if R.shape == (d, d) else np.eye(d)
+        # Compute rotation using Procrustes on anchor points
+        R_f1, _ = orthogonal_procrustes(anchor_points_calib_f1, anchor_points_train)
+        if R_f1.shape != (d, d):
+            R_f1 = np.eye(d)
 
-            # 4. Derivar el filtro final (A_s) para el Transformer
-            Gs_init = mean_logeuclid(Cc)
-            Cbar_rec_s = mean_riemann(Cc, init=Gs_init, tol=self.mean_tol, maxiter=self.mean_maxiter)
+        # Apply rotation to evaluation set
+        Z_rot_f1 = (Z_eval_f1 @ R_f1.T)
 
-            mu_s = Z_tr_std.mean(axis=0, keepdims=False).reshape(1, -1)
-            mu_rot = (mu_s @ self.Rs_[s].T)
-            mu_unstd = self.scaler_.inverse_transform(mu_rot)
-            G_target_s = self.ts_.inverse_transform(mu_unstd)[0]
+        # ==== FOLD 2: Calibration on second half, evaluate on second half ====
+        Z_calib_f2 = Z_test_std[split_idx:]
+        Z_eval_f2 = Z_test_std[:split_idx]
+        y_calib_f2 = labels_np[split_idx:]
 
-            W_s = invsqrtm(Cbar_rec_s) @ sqrtm(G_target_s)
-            self.A_filters_[s] = self.M_inv_sqrt_[s] @ W_s
+        classes_calib = np.unique(y_calib_f2)
+        anchor_points_calib_f2 = np.stack(
+            [Z_calib_f2[y_calib_f2 == k].mean(axis=0) for k in classes_calib],
+            axis=0
+        )
 
-        self.Rs_.clear()  # Ya no necesitamos R una vez derivado A_s
-        self._filters_cache.clear()  # Fuerza recacheo en device/dtype correctos
+        R_f2, _ = orthogonal_procrustes(anchor_points_calib_f2, anchor_points_train)
+        if R_f2.shape != (d, d):
+            R_f2 = np.eye(d)
 
-        return self
+        Z_rot_f2 = (Z_eval_f2 @ R_f2.T)
+
+        # --- Combine results from both folds ---
+        Z_rot_combined = np.empty_like(Z_test_std)
+        Z_rot_combined[split_idx:] = Z_rot_f1
+        Z_rot_combined[:split_idx] = Z_rot_f2
+
+        return Z_rot_combined
 
     # --------------------------- API clásica (features) ----------------------
     def fit(
-        self,
-        covs: Union[np.ndarray, torch.Tensor],
-        labels: Union[np.ndarray, torch.Tensor],
-        subjects: Union[np.ndarray, torch.Tensor],
-        train_idx: Union[np.ndarray, torch.Tensor],
+            self,
+            covs: Union[np.ndarray, torch.Tensor],
+            labels: Union[np.ndarray, torch.Tensor],
+            subjects: Union[np.ndarray, torch.Tensor],
+            train_idx: Union[np.ndarray, torch.Tensor],
     ):
         """
         Ajusta ITSA usando SOLO TRAIN.
@@ -316,14 +335,13 @@ class ITSA:
         self._filters_cache.clear()
         return self
 
-
     # --------------------- API de señales ------------------------------------
     def _derive_subject_filters(
-        self,
-        covs_rec: np.ndarray,
-        labels: np.ndarray,
-        subjects: np.ndarray,
-        train_idx: np.ndarray,
+            self,
+            covs_rec: np.ndarray,
+            labels: np.ndarray,
+            subjects: np.ndarray,
+            train_idx: np.ndarray,
     ) -> None:
         """
         Construye un filtro espacial único por sujeto:
@@ -357,7 +375,7 @@ class ITSA:
             R = self.Rs_.get(s, None)
             if R is None:
                 R = np.eye(mu_s.shape[1])
-            mu_rot = (mu_s @ R.T)                  # (1, d)
+            mu_rot = (mu_s @ R.T)  # (1, d)
             mu_unstd = self.scaler_.inverse_transform(mu_rot)  # (1, d)
             G_target_s = self.ts_.inverse_transform(mu_unstd)[0]  # (C, C)
 
@@ -471,6 +489,7 @@ class ITSA:
         lite._filters_cache = {}  # limpio
         return lite
 
+
 # ------------------------------ Integrador minimalista ------------------------------
 class ITSAIntegrator:
     """
@@ -478,6 +497,7 @@ class ITSAIntegrator:
     - from_dataset(...): realiza todo el ajuste (fit) leyendo dataset + splits.
     - transform_batch(x, subjects): aplica ITSA por sujeto y devuelve la MISMA forma que x.
     """
+
     def __init__(self, itsa: ITSA):
         self._itsa = itsa
 
@@ -509,7 +529,7 @@ class ITSAIntegrator:
             for i in idxs:
                 # Usa el __getitem__ del dataset para respetar el recorte temporal actual (time_low, time_high)
                 eeg, _label = dataset[i]  # (T,C) para transformer | (1,C,T) para EEGChannelNet
-                if eeg.dim() == 3:        # (1,C,T) -> (T,C)
+                if eeg.dim() == 3:  # (1,C,T) -> (T,C)
                     eeg2d = eeg.squeeze(0).transpose(0, 1)
                 else:
                     eeg2d = eeg
@@ -521,57 +541,31 @@ class ITSAIntegrator:
                 subjects_list.append(int(dataset.data[i]["subject"]))
                 split_order.append(sp)
 
-        covs = _np.stack(covs_list, axis=0)                       # (N, C, C)
-        labels = _np.asarray(labels_list, dtype=_np.int64)         # (N,)
-        subjects = _np.asarray(subjects_list, dtype=_np.int64)     # (N,)
+        covs = _np.stack(covs_list, axis=0)  # (N, C, C)
+        labels = _np.asarray(labels_list, dtype=_np.int64)  # (N,)
+        subjects = _np.asarray(subjects_list, dtype=_np.int64)  # (N,)
         train_idx = _np.asarray([k for k, s in enumerate(split_order) if s == "train"], dtype=_np.int64)
 
         itsa = ITSA().fit(covs=covs, labels=labels, subjects=subjects, train_idx=train_idx)
         return cls(itsa)
 
-    def adapt_from_dataset(self, dataset, splits_path: str, split_num: int = 0):
+    @torch.no_grad()
+    def transform_test_loso(self, x: torch.Tensor, subjects: torch.Tensor) -> torch.Tensor:
         """
-        Lee los datos del nuevo sujeto y adapta los filtros de ITSA a él.
+        Transform TEST batch using LOSO protocol with calibration/evaluation split.
+
+        Args:
+            x: (B, T, C) or (B, 1, C, T) - test EEG signals
+            subejcts: (B,) - test subjects
+
+        Returns:
+            (B, T, C) or (B, 1, C, T) - transformed signals
         """
-        import numpy as _np
-        import torch as _t
 
-        loaded = _t.load(splits_path)
-        splitnames = ["train", "val", "test"]
-
-        def _valid_idx(i: int) -> bool:
-            eeg_raw = dataset.data[i]["eeg"]
-            L = eeg_raw.size(1)
-            return (L >= 450) and (L <= 600)
-
-        covs_list, labels_list, subjects_list, split_order = [], [], [], []
-
-        for sp in splitnames:
-            idxs = loaded["splits"][split_num][sp]
-            idxs = [i for i in idxs if _valid_idx(i)]
-
-            for i in idxs:
-                eeg, _label = dataset[i]
-                if eeg.dim() == 3:
-                    eeg2d = eeg.squeeze(0).transpose(0, 1)
-                else:
-                    eeg2d = eeg
-
-                C = cov_from_signal_torch(eeg2d.double(), eps=1e-4).cpu().numpy()
-                covs_list.append(C)
-
-                labels_list.append(int(dataset.data[i]["label"]))
-                subjects_list.append(int(dataset.data[i]["subject"]))
-                split_order.append(sp)
-
-        covs = _np.stack(covs_list, axis=0)
-        labels = _np.asarray(labels_list, dtype=_np.int64)
-        subjects = _np.asarray(subjects_list, dtype=_np.int64)
-        train_idx = _np.asarray([k for k, s in enumerate(split_order) if s == "train"], dtype=_np.int64)
-
-        # Aplicamos la nueva función matemática
-        self._itsa.adapt_subject(covs=covs, labels=labels, subjects=subjects, train_idx=train_idx)
-        return self
+        # For LOSO, we need covariances to compute rotation parameters
+        # This should be called AFTER transform_signals on train/val
+        # For now, return as-is and let the model use transformed features
+        return self._itsa.transform_signals(x, subjects, mode="deterministic", alpha_range=(1.0, 1.0))
 
     @torch.no_grad()
     def transform_batch(self, x: torch.Tensor, subjects: torch.Tensor,

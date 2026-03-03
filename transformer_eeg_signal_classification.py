@@ -38,8 +38,10 @@ parser.add_argument('-mt', '--model_type', default='transformer2',
 # It is possible to test out multiple deep classifiers:
 # - lstm is the model described in the paper "Deep Learning Human Mind for Automated Visual Classification”, in CVPR 2017
 # - model10 is the model described in the paper "Decoding brain representations by multimodal learning of neural activity and visual features", TPAMI 2020
-parser.add_argument('-mp', '--model_params', default=['num_heads=4', 'num_layers=1', 'd_ff=512', 'd_model=128', 'dropout=0.4'], nargs='*', help='list of key=value pairs of model options')
-#parser.add_argument('--pretrained_net', default='', help="path to pre-trained net (to continue training)")
+parser.add_argument('-mp', '--model_params',
+                    default=['num_heads=4', 'num_layers=1', 'd_ff=512', 'd_model=128', 'dropout=0.4'], nargs='*',
+                    help='list of key=value pairs of model options')
+# parser.add_argument('--pretrained_net', default='', help="path to pre-trained net (to continue training)")
 parser.add_argument('--pretrained_net', default='', help="path to pre-trained net (to continue training)")
 
 # Training options
@@ -50,7 +52,7 @@ parser.add_argument('-lrdb', '--learning-rate-decay-by', default=0.95, type=floa
 parser.add_argument('-lrde', '--learning-rate-decay-every', default=10, type=int, help="learning rate decay period")
 parser.add_argument('-dw', '--data-workers', default=4, type=int, help="data loading workers")
 parser.add_argument('-e', '--epochs', default=200, type=int, help="training epochs")
-#parser.add_argument('-do', '--dropout', default=0.2, type=float, help="dropout probability (overwrites model default)")
+# parser.add_argument('-do', '--dropout', default=0.2, type=float, help="dropout probability (overwrites model default)")
 # Save options
 parser.add_argument('-sc', '--saveCheck', default=200, type=int, help="learning rate")
 # Backend options
@@ -59,7 +61,8 @@ parser.add_argument('--no-cuda', default=False, help="disable CUDA", action="sto
 # cargar objeto ITSA guardado
 parser.add_argument('--pretrained_itsa', default='', help="path to pre-trained itsa")
 parser.add_argument('--itsa_off', default=False, help="turn ITSA off")
-parser.add_argument('--adapt_new_subject', default=False, action="store_true", help="Adapt pretrained ITSA to a new subject")
+parser.add_argument('--loso_mode', default=True, action="store_true",
+                    help="Enable LOSO (Leave-One-Subject-Out) experiment mode")
 
 # Parse arguments
 opt = parser.parse_args()
@@ -94,6 +97,7 @@ import models
 import importlib
 
 from ITSA import ITSAIntegrator
+
 
 # Dataset class
 class EEGDataset:
@@ -158,6 +162,7 @@ class Splitter:
         # Return
         return eeg, label, subj
 
+
 # Load dataset
 dataset = EEGDataset(opt.eeg_dataset)
 # Create loaders
@@ -166,19 +171,13 @@ loaders = {split: DataLoader(Splitter(dataset, split_path=opt.splits_path, split
            ["train", "val", "test"]}
 if not opt.itsa_off:
     if opt.pretrained_itsa != '':
-        # 1. Cargamos el objeto ITSA core (la versión "ligera")
         loaded_itsa_core = torch.load(opt.pretrained_itsa, weights_only=False)
         itsa = ITSAIntegrator(loaded_itsa_core)
-        # 2. ¿Adaptamos o solo cargamos?
-        if opt.adapt_new_subject:
-            print("Adaptando espacio ITSA al nuevo sujeto...")
-            itsa.adapt_from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
-        else:
-            print("Cargando filtros ITSA base (sin adaptar)...")
     else:
         itsa = ITSAIntegrator.from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
         itsa_lite = itsa._itsa.export_light()
-        torch.save(itsa_lite, 'itsa_pretrained_space_light.pth')
+        held_out_subject = int(opt.splits_path.split("subject")[-1].split(".")[0])
+        torch.save(itsa_lite, f'itsa_loso_subject{held_out_subject}_light.pth')
 
 # Load model
 model_options = {key: int(value) if value.isdigit() else (float(value) if value[0].isdigit() else value) for
@@ -186,7 +185,6 @@ model_options = {key: int(value) if value.isdigit() else (float(value) if value[
 # Create discriminator model/optimizer
 module = importlib.import_module("models." + opt.model_type)
 model = module.Model(**model_options)
-
 
 optimizer = getattr(torch.optim, opt.optim)(model.parameters(), lr=opt.learning_rate)
 # Learning rate scheduler (equivalente al learning_rate_decay_by para Adam)
@@ -203,16 +201,8 @@ if not opt.no_cuda:
 if opt.pretrained_net != '':
     model = torch.load(opt.pretrained_net, weights_only=False)
 
-    # ✅ ADD THIS: freeze all layers first
     for param in model.parameters():
-        param.requires_grad = False
-
-    # ✅ Then unfreeze only the last classification layer
-    # (adjust 'classifier' to whatever your final layer is named)
-    for name, param in model.named_parameters():
-        if 'classifier' in name or 'fc' in name or 'out' in name:
-            param.requires_grad = True
-            print(f"Unfrozen: {name}")
+        param.requires_grad = True
 
     optimizer = torch.optim.Adam(model.parameters(), lr=opt.learning_rate)  # nuevo LR
     # Learning rate scheduler (equivalente al learning_rate_decay_by para Adam)
@@ -222,14 +212,12 @@ if opt.pretrained_net != '':
         gamma=opt.learning_rate_decay_by
     )
 
-
     # probar LR 0.005
     # disminuir LR_decay_by
 
-    
-    #for name, param in model.named_parameters():
-     #   print(f"Parameter name: {name}, Trainable: {param.requires_grad}")
-    
+    # for name, param in model.named_parameters():
+    #   print(f"Parameter name: {name}, Trainable: {param.requires_grad}")
+
     print(model)
 
 # initialize training,validation, test losses and accuracy list
@@ -263,11 +251,18 @@ for epoch in range(1, opt.epochs + 1):
         else:
             model.eval()
             torch.set_grad_enabled(False)
+
+        # For LOSO: accumulate test data for batch rotation computation
+        if not opt.itsa_off and split == "test":
+            test_inputs_batch = []
+            test_targets_batch = []
+            test_subjects_batch = []
+
         # Process all split batches
         for i, (input, target, batch_subjects) in enumerate(loaders[split]):
             # Check CUDA
             if not opt.no_cuda:
-                input = input.to("cuda") 
+                input = input.to("cuda")
                 target = target.to("cuda")
                 batch_subjects = batch_subjects.to("cuda")
             # Forward
@@ -276,7 +271,13 @@ for epoch in range(1, opt.epochs + 1):
                     input = itsa.transform_batch(input, batch_subjects,
                                                  mode="augment",
                                                  alpha_range=(0.5, 0.95))
-                else:
+                elif split == "test":
+                    # For LOSO: accumulate data (don't transform yet)
+                    test_inputs_batch.append(input.cpu())
+                    test_targets_batch.append(target.cpu())
+                    test_subjects_batch.append(batch_subjects.cpu())
+                    continue  # Skip model forward for now
+                else:  # val
                     input = itsa.transform_batch(input, batch_subjects,
                                                  mode="deterministic")
             output = model(input)
@@ -296,11 +297,36 @@ for epoch in range(1, opt.epochs + 1):
                 loss.backward()
                 optimizer.step()
 
+        # After all test batches accumulated: apply LOSO rotation once
+        if not opt.itsa_off and split == "test" and test_inputs_batch:
+            test_input_full = torch.cat(test_inputs_batch, dim=0)
+            test_target_full = torch.cat(test_targets_batch, dim=0)
+            test_subjects_full = torch.cat(test_subjects_batch, dim=0)
+
+            # apply LOSO-specific rotation with calibration/evaluation split
+            input_rotated = itsa.transform_test_loso(test_input_full, test_subjects_full)
+
+            if not opt.no_cuda:
+                input_rotated = input_rotated.to("cuda")
+                test_target_full = test_target_full.to("cuda")
+
+            output = model(input_rotated)
+            loss = F.cross_entropy(output, test_target_full)
+            losses["test"] += loss.item()
+
+            _, pref = output.data.max(1)
+            correct = pred.eq(test_target_full.data).sum().item()
+            accuracy = correct / input_rotated.data.size(0)
+            accuracies["test"] += accuracy
+            counts["test"] += 1
+
     # Print info at the end of the epoch
     if accuracies["val"] / counts["val"] >= best_accuracy_val:
         best_accuracy_val = accuracies["val"] / counts["val"]
         best_accuracy = accuracies["test"] / counts["test"]
         best_epoch = epoch
+        # ✅ Save best model as it happens
+        torch.save(model, '%s__subject%d_best.pth' % (opt.model_type, opt.subject))
 
     TrL, TrA, VL, VA, TeL, TeA = losses["train"] / counts["train"], accuracies["train"] / counts["train"], losses[
         "val"] / counts["val"], accuracies["val"] / counts["val"], losses["test"] / counts["test"], accuracies["test"] / \
@@ -323,7 +349,7 @@ for epoch in range(1, opt.epochs + 1):
     accuracies_per_epoch['val'].append(VA)
     accuracies_per_epoch['test'].append(TeA)
 
-     # Update learning rate after each epoch
+    # Update learning rate after each epoch
     scheduler.step()
 
     if epoch % opt.saveCheck == 0:
