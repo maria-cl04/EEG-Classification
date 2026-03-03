@@ -80,7 +80,7 @@ Aplica \(A_s\) a **señales** y devuelve la **misma forma** que `x`:
 ```python
 import numpy as np
 import torch
-from ITSA import ITSA, cov_from_signal_torch
+from LOSO_experiments.ITSA import ITSA, cov_from_signal_torch
 
 # Suponemos que ya tienes:
 # - dataset (como en tu script)
@@ -94,12 +94,12 @@ labels_tr = []
 subjects_tr = []
 
 for j in idx_train:
-    x = dataset.data[j]["eeg"].float().t()                  # (T_all, 128)
-    x = x[opt.time_low:opt.time_high, :]                      # (T, 128)
+    x = dataset.data[j]["eeg"].float().t()  # (T_all, 128)
+    x = x[opt.time_low:opt.time_high, :]  # (T, 128)
     if not opt.no_cuda:
         x = x.cuda()
-    C = cov_from_signal_torch(x, eps=1e-6)                    # (128,128) torch
-    C_list.append(C.detach().cpu().numpy())                   # -> NumPy
+    C = cov_from_signal_torch(x, eps=1e-6)  # (128,128) torch
+    C_list.append(C.detach().cpu().numpy())  # -> NumPy
     labels_tr.append(int(dataset.data[j]["label"]))
     subjects_tr.append(int(dataset.data[j]["subject"]))
 
@@ -108,7 +108,7 @@ labels_tr = np.asarray(labels_tr, dtype=np.int64)
 subjects_tr = np.asarray(subjects_tr, dtype=np.int64)
 train_idx = np.arange(len(covs_tr), dtype=np.int64)
 
-itsa.fit(covs_tr, labels_tr, subjects_tr, train_idx)          # ajusta artefactos
+itsa.fit(covs_tr, labels_tr, subjects_tr, train_idx)  # ajusta artefactos
 ```
 
 ### B) Uso por batch — `transform_signals` antes del modelo

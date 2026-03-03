@@ -1,5 +1,5 @@
 import torch
-from ITSA import ITSAIntegrator, cov_from_signal_torch
+from LOSO_experiments.ITSA import ITSAIntegrator
 
 # ============================================================
 #  CONFIGURATION — edit these paths and experiments
@@ -14,10 +14,10 @@ TIME_HIGH = 460
 # If you have a single "all subjects" splits file, see the note below.
 EXPERIMENTS = [
     {
-        "left_out":    2,
-        "subjects":    [1, 3, 4, 5, 6],
+        "left_out":    3,
+        "subjects":    [1, 2, 4, 5, 6],
         "splits_path": r"data\splits_preTraining_subject23456.pth",
-        "output_file": "itsa_pretrained_excl_subject2.pth",
+        "output_file": "itsa_pretrained_excl_subject3.pth",
     },
 ]
 r"""
