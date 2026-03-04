@@ -8,13 +8,13 @@ parser = argparse.ArgumentParser(description="Template")
 
 ### BLOCK DESIGN ###
 # Data
-parser.add_argument('-ed', '--eeg-dataset', default=r"/kaggle/input/datasets/marii04/eeg-datasets/eeg_55_95_std.pth", help="EEG dataset path") #55-95Hz
+parser.add_argument('-ed', '--eeg-dataset', default=r"C:\Users\maria\Documents\Beca\Transformer-22Abril\data\eeg_55_95_std.pth", help="EEG dataset path") #55-95Hz
 # parser.add_argument('-ed', '--eeg-dataset', default=r"data\block\eeg_5_95_std.pth", help="EEG dataset path")  # 5-95Hz
 # parser.add_argument('-ed', '--eeg-dataset', default=r"data\block\eeg_14_70_std.pth", help="EEG dataset path") #14-70Hz
 # Splits
 #parser.add_argument('-sp', '--splits-path', default=r"/kaggle/input/datasets/marii04/single-subject-splits/block_splits_by_single_subject_1.pth", help="splits path") #Subject 1
 #parser.add_argument('-sp', '--splits-path', default=r"/kaggle/input/datasets/marii04/single-subject-splits/block_splits_by_single_subject23456.pth", help="splits path") #Subjects 2,3,4,5,6
-parser.add_argument('-sp', '--splits-path', default=r"/kaggle/input/datasets/marii04/splits-all-subjects/block_splits_by_image_all.pth", help="splits path") #All subjects
+parser.add_argument('-sp', '--splits-path', default=r"C:\Users\maria\Documents\Beca\Splits-LOSO\block_splits_LOSO_subject1.pth", help="splits path") #All subjects
 #parser.add_argument('-sp', '--splits-path', default=r"/kaggle/input/datasets/marii04/splits-loso/block_splits_LOSO_subject6.pth", help="splits path") #LOSO
 
 #parser.add_argument('-sp', '--splits-path', default=r"/kaggle/input/datasets/marii04/splits-experiments-with-fine-tuning/splits_fineTuning_subject1.pth", help="splits path") #Subject 1
@@ -25,7 +25,7 @@ parser.add_argument('-sp', '--splits-path', default=r"/kaggle/input/datasets/mar
 parser.add_argument('-sn', '--split-num', default=0, type=int, help="split number")  # leave this always to zero.
 
 # Subject selecting
-parser.add_argument('-sub', '--subject', default=1, type=int,
+parser.add_argument('-sub', '--subject', default=0, type=int,
                     help="choose a subject from 1 to 6, default is 0 (all subjects)")
 
 # Time options: select from 20 to 460 samples from EEG data
@@ -174,7 +174,7 @@ if not opt.itsa_off:
         loaded_itsa_core = torch.load(opt.pretrained_itsa, weights_only=False)
         itsa = ITSAIntegrator(loaded_itsa_core)
     else:
-        itsa = ITSAIntegrator.from_dataset(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
+        itsa = ITSAIntegrator.from_dataset_loso(dataset, splits_path=opt.splits_path, split_num=opt.split_num)
         itsa_lite = itsa._itsa.export_light()
         held_out_subject = int(opt.splits_path.split("subject")[-1].split(".")[0])
         torch.save(itsa_lite, f'itsa_loso_subject{held_out_subject}_light.pth')
@@ -252,12 +252,6 @@ for epoch in range(1, opt.epochs + 1):
             model.eval()
             torch.set_grad_enabled(False)
 
-        # For LOSO: accumulate test data for batch rotation computation
-        if not opt.itsa_off and split == "test":
-            test_inputs_batch = []
-            test_targets_batch = []
-            test_subjects_batch = []
-
         # Process all split batches
         for i, (input, target, batch_subjects) in enumerate(loaders[split]):
             # Check CUDA
@@ -271,13 +265,7 @@ for epoch in range(1, opt.epochs + 1):
                     input = itsa.transform_batch(input, batch_subjects,
                                                  mode="augment",
                                                  alpha_range=(0.5, 0.95))
-                elif split == "test":
-                    # For LOSO: accumulate data (don't transform yet)
-                    test_inputs_batch.append(input.cpu())
-                    test_targets_batch.append(target.cpu())
-                    test_subjects_batch.append(batch_subjects.cpu())
-                    continue  # Skip model forward for now
-                else:  # val
+                else:  # val and test: apply pre-computed filter
                     input = itsa.transform_batch(input, batch_subjects,
                                                  mode="deterministic")
             output = model(input)
@@ -296,29 +284,6 @@ for epoch in range(1, opt.epochs + 1):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
-        # After all test batches accumulated: apply LOSO rotation once
-        if not opt.itsa_off and split == "test" and test_inputs_batch:
-            test_input_full = torch.cat(test_inputs_batch, dim=0)
-            test_target_full = torch.cat(test_targets_batch, dim=0)
-            test_subjects_full = torch.cat(test_subjects_batch, dim=0)
-
-            # apply LOSO-specific rotation with calibration/evaluation split
-            input_rotated = itsa.transform_test_loso(test_input_full, test_subjects_full)
-
-            if not opt.no_cuda:
-                input_rotated = input_rotated.to("cuda")
-                test_target_full = test_target_full.to("cuda")
-
-            output = model(input_rotated)
-            loss = F.cross_entropy(output, test_target_full)
-            losses["test"] += loss.item()
-
-            _, pref = output.data.max(1)
-            correct = pred.eq(test_target_full.data).sum().item()
-            accuracy = correct / input_rotated.data.size(0)
-            accuracies["test"] += accuracy
-            counts["test"] += 1
 
     # Print info at the end of the epoch
     if accuracies["val"] / counts["val"] >= best_accuracy_val:
