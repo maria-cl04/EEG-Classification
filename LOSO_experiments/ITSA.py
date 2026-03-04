@@ -536,7 +536,7 @@ class ITSA:
 
         # Eliminamos/compactamos el resto
         lite.reference_G_ = self.reference_G_  # (C,C), puedes castear a float32 si quieres
-        lite.M_inv_sqrt_ = {}  # no necesitamos las de sujetos base
+        lite.M_inv_sqrt_ = self.M_inv_sqrt_
         lite.Rs_ = {}  # enorme → fuera
         lite.A_filters_ = self.A_filters_  # Conservamos los filtros base (pesan poquísimo)
         lite._filters_cache = {}  # limpio
