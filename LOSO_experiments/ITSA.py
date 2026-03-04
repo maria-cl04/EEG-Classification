@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from typing import Dict, Optional, Union
+from tqdm.auto import tqdm
 
 # PyRiemann utilities
 from pyriemann.utils.mean import mean_riemann, mean_logeuclid
@@ -123,7 +124,7 @@ class ITSA:
         N = covs.shape[0]
         mask_tr = np.zeros(N, dtype=bool)
         mask_tr[train_idx] = True
-        for s in np.unique(subjects):
+        for s in tqdm(np.unique(subjects), desc="1/3: Calculating Riemannian Means"):
             s = int(s)
             m = (subjects == s)
             m_tr = m & mask_tr
@@ -192,7 +193,7 @@ class ITSA:
         d = Z_tr_std.shape[1]
         self.Rs_.clear()
 
-        for s in np.unique(s_tr):
+        for s in tqdm(np.unique(s_tr), desc="2/3: Fitting Rotations"):
             s = int(s)
             m = (s_tr == s)
             Zs, ys = Z_tr_std[m], y_tr[m]
@@ -328,34 +329,27 @@ class ITSA:
                              tol=self.mean_tol, maxiter=self.mean_maxiter)
             self.M_inv_sqrt_[test_s] = invsqrtm(M)
 
-        # Step 1–3 via the fixed transform_test_loso → fully aligned TS features
-        Z_rot = self.transform_test_loso(covs_np, labels_np, subjects_np)  # (N, d)
-
-        # Back-project the mean rotated feature to SPD space to get G_target
-        mu_rot = Z_rot.mean(axis=0, keepdims=True)  # (1, d)
-        mu_unstd = self.scaler_.inverse_transform(mu_rot)  # (1, d)
-        G_target = self.ts_.inverse_transform(mu_unstd)[0]  # (C, C)
-        G_target = to_spd_np(G_target, eps=self.subject_eps)
-
-        # Mean recentered covariance for the test subject
-        covs_rec = self._apply_subject_recentering_np(covs_np, subjects_np)
-        Cbar_rec = mean_riemann(
-            covs_rec,
-            init=mean_logeuclid(covs_rec),
-            tol=self.mean_tol,
-            maxiter=self.mean_maxiter,
-        )
-        Cbar_rec = to_spd_np(Cbar_rec, eps=self.subject_eps)
-
-        # Recolouring: Cbar_rec → G_target  (identical logic to _derive_subject_filters)
-        Cbar_rec_isqrt = invsqrtm(Cbar_rec)
-        G_target_sqrt = sqrtm(G_target)
-        W = Cbar_rec_isqrt @ G_target_sqrt
-
-        # Full spatial filter: A = M^{-1/2} @ W
+        # Recentering-only filter: A = M^{-1/2}
+        # The full back-projection (recolour via 40-class SVD rotation) is too
+        # noisy for high-class-count LOSO — the rotation estimate from N_test/2
+        # samples across 40 classes is unreliable and produces out-of-distribution
+        # directions. Recentering alone (Adaptive M) is stable and contributes
+        # most of ITSA's benefit. The rotation step can only help if class
+        # centroids are well-estimated, which requires far more test samples per
+        # class than are available here.
         if self.A_filters_ is None:
             self.A_filters_ = {}
-        self.A_filters_[test_s] = self.M_inv_sqrt_[test_s] @ W
+        self.A_filters_[test_s] = self.M_inv_sqrt_[test_s].copy()
+        self._filters_cache.clear()
+
+        # Normalise filter to identity scale to prevent signal amplitude explosion
+        A = self.A_filters_[test_s]
+        n_ch = A.shape[0]
+        current_norm = np.linalg.norm(A)
+        target_norm = np.sqrt(n_ch)  # same scale as identity matrix
+        if current_norm > target_norm * 2:  # only clip if genuinely exploded
+            self.A_filters_[test_s] = A * (target_norm / current_norm)
+
         self._filters_cache.clear()
 
     # --------------------------- API clásica (features) ----------------------
@@ -414,7 +408,7 @@ class ITSA:
         s_tr = subjects[mask_tr]
 
         self.A_filters_ = {}
-        for s in np.unique(s_tr):
+        for s in tqdm(np.unique(s_tr), desc="3/3: Deriving Filters"):
             s = int(s)
             m = (s_tr == s)
 
@@ -624,7 +618,7 @@ class ITSAIntegrator:
 
         for sp in ["train", "val", "test"]:
             idxs = [i for i in loaded["splits"][split_num][sp] if _valid_idx(i)]
-            for i in idxs:
+            for i in tqdm(idxs, desc=f"Loading {sp} splits", leave=False):
                 eeg, _ = dataset[i]
                 eeg2d = eeg.squeeze(0).transpose(0, 1) if eeg.dim() == 3 else eeg
                 C = cov_from_signal_torch(eeg2d.double(), eps=1e-4).cpu().numpy()
