@@ -20,6 +20,7 @@
 14. [Hyperparameters and How to Tune Them](#14-hyperparameters-and-how-to-tune-them)
 15. [How to Run](#15-how-to-run)
 16. [What to Expect](#16-what-to-expect)
+17. [Bibliography](#17-bibliography)
 
 ---
 
@@ -437,3 +438,19 @@ Convergence below 0.3 is excellent. If loss plateaus above 0.6, try reducing the
 | Fine-tuning | +2–5% on test subject |
 
 The LOSO improvement is the most uncertain because it depends heavily on how different Subject 6's EEG patterns are from the other 5. In the best case, pre-training aligns the encoder to universal EEG structure that Subject 6 shares; in the worst case, if Subject 6 is an outlier, the improvement is smaller but pre-training should never hurt.
+
+---
+## 17. Bibliography
+
+***DISCLOSURE:** Claude.ai was not able to give me the exact links or references used, since it just used the training data, so it provided me with the most relevant references for each type of method.*
+
+### Primary Paper:
+> He, K., Chen, X., Xie, S., Li, Y., Dollár, P., & Girshick, R. (2022). Masked Autoencoders Are Scalable Vision Learners. Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR).
+
+The 75% mask ratio, the asymmetric encoder-decoder design (large encoder, small decoder), computing MSE loss only on masked positions, and discarding the decoder after pre-training all come directly from this paper.
+
+### Foundational Precursor - masked language modelling:
+> Devlin, J., Chang, M. W., Lee, K., & Toutanova, K. (2019). BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. Proceedings of the North American Chapter of the Association for Computational Linguistics (NAACL).
+
+The README's discussion of why 15% masking (BERT's ratio) is too easy for EEG, and the general concept of masked token prediction as a pre-training objective, references BERT as the origin of this idea.
+
