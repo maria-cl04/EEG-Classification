@@ -20,6 +20,7 @@
 14. [How to Run](#14-how-to-run)
 15. [Interpreting the Output](#15-interpreting-the-output)
 16. [What to Expect](#16-what-to-expect)
+17. [Bibliography](#17-bibliography)
 
 ---
 
@@ -441,3 +442,13 @@ All values are approximate — LOSO results for this dataset are inherently nois
 1. The delta between prototypical and softmax inference demonstrates that improved *embedding structure* (from SupCon) can be exploited at inference time, even without retraining the classifier.
 2. The combination of SupCon + prototypical inference provides additive benefit: SupCon makes clusters tighter, prototypical inference uses the cluster centres directly.
 3. Even at near-chance levels, the improvement above chance (e.g., 5% vs. 2.5% = 2× chance) is a meaningful result given the known difficulty of cross-subject decoding on 40-class visual EEG.
+
+---
+## 17. Bibliography
+
+***DISCLOSURE:** Claude.ai was not able to give me the exact links or references used, since it just used the training data, so it provided me with the most relevant references for each type of method.*
+
+### Primary Paper:
+> Snell, J., Swersky, K., & Zemel, R. (2017). Prototypical Networks for Few-Shot Learning. Advances in Neural Information Processing Systems (NeurIPS), 30.
+
+This paper introduced the exact classifcation procedure used in the script: compute class prototypes as mean embeddings, classify by nearest prototype using Euclidean distance. The mathematical justification (prototype as the point minimising sum of squared distances) is from this paper.
