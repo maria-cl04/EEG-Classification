@@ -16,9 +16,9 @@
 10. [Hyperparameters and How to Tune Them](#10-hyperparameters-and-how-to-tune-them)
 11. [How to Run](#11-how-to-run)
 12. [What to Expect](#12-what-to-expect)
+13. [Bibliography](#13-bibliography)
 
 ---
-
 ## 1. What Problem Does This Solve?
 
 Your transformer learns to classify EEG signals by converting each trial into a **point in a high-dimensional space**. Imagine a 128-dimensional space (because your `d_model=128`) where every EEG trial gets placed somewhere. Trials that the model considers similar end up close together; trials it considers different end up far apart.
@@ -399,3 +399,19 @@ python transformer_eeg_signal_classification.py --supcon --lambda-supcon 0.3
 | Fine-tuning | +1–3% on test subject after fine-tuning phase |
 
 The biggest gains are in LOSO and multi-subject, which is exactly where cross-subject generalisation matters most. If you see no improvement in LOSO, check that the batch contains samples from multiple subjects — if your DataLoader somehow groups by subject, there are no cross-subject positives and the loss degenerates.
+
+---
+## 13. Bibliography
+
+***DISCLOSURE:** Claude.ai was not able to give me the exact links or references used, since it just used the training data, so it provided me with the most relevant references for each type of method.*
+
+### Primary Paper - the loss function itself:
+> Khosla, P., Tian, P., Wang, X., Smits, W., Liu, Y., Lee, H., Krishnan, D., Isola, P., & Tian, Y. (2020). Supervised Contrastive Learning. Advances in Neural Information Processing Systems (NeurIPS), 33.
+
+This is the exact paper the `SupConLoss` module implements. The temperature parameter (0.07), the projection head design, and the formula averaging over all positives per anchor all come directly from here.
+
+### Secondary paper - projection head concept:
+> Chen, T., Kornblith, S., Norouzi, M., & Hinton, G. (2020). A Simple Framework for Contrastive Learning of Visual Representations (SimCLR). Proceedings of the International Conference on Machine Learning (ICML).
+
+SimCLR introduced the idea of a separate projection head that is discarded after training. The SupCon paper builds on this design, and the reasoning of why the projection and classifier heads need to be separate comes from both of these papers.
+
