@@ -59,7 +59,6 @@ parser.add_argument('-sc', '--saveCheck', default=200, type=int, help="learning 
 parser.add_argument('--no-cuda', default=False, help="disable CUDA", action="store_true")
 
 # SimCLR options
-# SimCLR options
 parser.add_argument('--simclr', default=False, action="store_true", help="Enable SimCLR self-supervised training")
 parser.add_argument('--lambda-simclr', default=0.05, type=float, help="Weight of the SimCLR loss")
 parser.add_argument('--simclr-temp', default=0.5, type=float, help="Temperature for NT-Xent loss")
