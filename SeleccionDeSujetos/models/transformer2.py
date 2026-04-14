@@ -8,57 +8,41 @@ import copy
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, num_heads):
         super(MultiHeadAttention, self).__init__()
-        # Ensure that the model dimension (d_model) is divisible by the number of heads
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
 
-        # Initialize dimensions
-        self.d_model = d_model # Model's dimension
-        self.num_heads = num_heads # Number of attention heads
-        self.d_k = d_model // num_heads # Dimension of each head's key, query, and value
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
 
-        # Linear layers for transforming inputs
-        self.W_q = nn.Linear(d_model, d_model) # Query transformation
-        self.W_k = nn.Linear(d_model, d_model) # Key transformation
-        self.W_v = nn.Linear(d_model, d_model) # Value transformation
-        self.W_o = nn.Linear(d_model, d_model) # Output transformation
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
 
     def scaled_dot_product_attention(self, Q, K, V, mask=None):
-        # Calculate attention scores
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-
-        # Apply mask if provided (useful for preventing attention to certain parts like padding)
         if mask is not None:
             attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
-
-        # Softmax is applied to obtain attention probabilities
         attn_probs = torch.softmax(attn_scores, dim=-1)
-
-        # Multiply by values to obtain the final output
         output = torch.matmul(attn_probs, V)
         return output
 
-    def split_heads(self, x): # it enables the model to process multiple attention heads concurrently, allowing for parallel computation
-        # Reshape the input to have num_heads for multi-head attention
+    def split_heads(self, x):
         batch_size, seq_length, d_model = x.size()
         return x.view(batch_size, seq_length, self.num_heads, self.d_k).transpose(1, 2)
 
     def combine_heads(self, x):
-        # Combine the multiple heads back to original shape
         batch_size, _, seq_length, d_k = x.size()
         return x.transpose(1, 2).contiguous().view(batch_size, seq_length, self.d_model)
 
     def forward(self, Q, K, V, mask=None):
-        # Apply linear transformations and split heads
         Q = self.split_heads(self.W_q(Q))
         K = self.split_heads(self.W_k(K))
         V = self.split_heads(self.W_v(V))
-
-        # Perform scaled dot-product attention
         attn_output = self.scaled_dot_product_attention(Q, K, V, mask)
-
-        # Combine heads and apply output transformation
         output = self.W_o(self.combine_heads(attn_output))
         return output
+
 
 class PositionWiseFeedForward(nn.Module):
     def __init__(self, d_model, d_ff):
@@ -69,6 +53,7 @@ class PositionWiseFeedForward(nn.Module):
 
     def forward(self, x):
         return self.fc2(self.relu(self.fc1(x)))
+
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_seq_length):
@@ -103,6 +88,7 @@ class EncoderLayer(nn.Module):
         x = self.norm2(x + self.dropout(ff_output))
         return x
 
+
 class Model(nn.Module):
     def __init__(self, input_dim=128, d_model=128, num_heads=4, d_ff=512, num_layers=1,
                  max_seq_length=440, num_classes=40, dropout=0.4):
@@ -117,18 +103,42 @@ class Model(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(d_model, num_classes)
 
-    def forward(self, x, mask=None):
+    def _encode(self, x, mask=None):
+        """
+        Shared encoder trunk used by both forward() and get_embeddings().
+        Returns the mean-pooled feature vector of shape (B, d_model),
+        post-mean-pooling and pre-classification.
+        """
         if x.dim() == 4:
             # Convert from (B, 1, 128, 440) → (B, 440, 128)
             x = x.squeeze(1).permute(0, 2, 1)
 
-        x = self.embedding(x)            # (B, 440, d_model)
-        x = self.pos_encoder(x)          # (B, 440, d_model)
+        x = self.embedding(x)           # (B, 440, d_model)
+        x = self.pos_encoder(x)         # (B, 440, d_model)
         x = self.dropout(x)
 
         for layer in self.encoder_layers:
-            x = layer(x, mask)           # (B, 440, d_model)
+            x = layer(x, mask)          # (B, 440, d_model)
 
-        x = x.mean(dim=1)                # (B, d_model) → mean pooling
-        out = self.classifier(x)         # (B, num_classes)
+        x = x.mean(dim=1)               # (B, d_model) — mean pooling
+        return x
+
+    def forward(self, x, mask=None):
+        x = self._encode(x, mask)
+        out = self.classifier(x)        # (B, num_classes)
         return out
+
+    def get_embeddings(self, x, mask=None):
+        """
+        Returns the 128-dim feature embeddings (post-mean-pooling,
+        pre-classification) used for Subject Centroid calculation
+        in Phase 2 of Similarity-Based Subject Selection.
+
+        Args:
+            x    : EEG input tensor — (B, 440, 128) or (B, 1, 128, 440)
+            mask : Optional attention mask
+
+        Returns:
+            embeddings : Tensor of shape (B, d_model)
+        """
+        return self._encode(x, mask)

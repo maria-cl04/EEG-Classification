@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F  # <--- 1. ADD THIS IMPORT
 
 class TripletLoss(nn.Module):
     """Online hard triplet loss for EEG classification.
@@ -30,6 +30,8 @@ class TripletLoss(nn.Module):
     def forward(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         N = embeddings.size(0)
         device = embeddings.device
+
+        embeddings = F.normalize(embeddings, p=2, dim=1)
 
         # --- Pairwise Euclidean distances (N x N) ---
         # ||a - b||^2 = ||a||^2 + ||b||^2 - 2 a·b
