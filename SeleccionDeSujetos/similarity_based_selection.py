@@ -31,13 +31,15 @@ python similarity_based_selection.py \
 
 import argparse
 import importlib
-import os
+# import os
 
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+
+from sklearn.metrics import pairwise_distances # <-- ADD THIS
 
 cudnn.benchmark = True
 
@@ -64,13 +66,13 @@ parser.add_argument('-b',    '--batch-size',              default=128,  type=int
 parser.add_argument('-lr',   '--learning-rate',           default=0.001, type=float)
 parser.add_argument('-lrdb', '--learning-rate-decay-by',  default=0.95,  type=float)
 parser.add_argument('-lrde', '--learning-rate-decay-every', default=10,  type=int)
-parser.add_argument('-e',    '--epochs',          default=200, type=int,
+parser.add_argument('-e',    '--epochs',          default=1, type=int,
     help="Epochs for Phase 1 baseline training")
-parser.add_argument('--targeted-epochs', default=200, type=int,
+parser.add_argument('--targeted-epochs', default=1, type=int,
     help="Epochs for Phase 3 targeted training (defaults to --epochs)")
 
 # Phase 1 shortcut
-parser.add_argument('--baseline-model', default='',
+parser.add_argument('--baseline-model', default='baseline_model_all_subjects.pth',
     help="Path to a pre-trained baseline .pth — skips Phase 1 if provided")
 
 # Subject split for Phase 3
@@ -78,6 +80,17 @@ parser.add_argument('--n-train', default=2, type=int,
     help="Number of closest subjects used for training (default: 2)")
 parser.add_argument('--n-val', default=1, type=int,
     help="Number of subjects used for validation (default: 1)")
+
+# Fine-tuning stage (Phase 3, Fix 1)
+parser.add_argument('--finetune-ratio', default=0.2, type=float,
+    help="Fraction of target subject data used for fine-tuning (rest is test). Default: 0.2")
+parser.add_argument('--finetune-epochs', default=50, type=int,
+    help="Epochs for the fine-tuning stage on the target subject")
+parser.add_argument('--finetune-lr', default=0.0001, type=float,
+    help="Learning rate for the fine-tuning stage (should be lower than pre-training LR)")
+parser.add_argument('--freeze-encoder', default=False, action='store_true',
+    help="If set, freeze all encoder layers and only fine-tune the classifier head")
+
 
 # Misc
 parser.add_argument('--no-cuda', default=True, action='store_true')
@@ -153,6 +166,44 @@ class SubjectDataset(Dataset):
     def __getitem__(self, i):
         return self.full_dataset[self.indices[i]]
 
+class SubjectDatasetSplit(Dataset):
+    """
+    Splits a SubjectDataset into two non-overlapping partitions.
+    Use split='finetune' to get the first `finetune_ratio` fraction,
+    or split='test' to get the remainder.
+
+    The split is done on the already-filtered indices inside SubjectDataset,
+    so the validity check (eeg length 450-600) is inherited automatically.
+    """
+    def __init__(self, subject_dataset: SubjectDataset,
+                 finetune_ratio: float = 0.2,
+                 split: str = 'finetune',
+                 seed: int = 42):
+        assert 0.0 < finetune_ratio < 1.0, "finetune_ratio must be between 0 and 1"
+        assert split in ('finetune', 'test'), "split must be 'finetune' or 'test'"
+
+        rng = np.random.RandomState(seed)
+        all_indices = np.arange(len(subject_dataset))
+        rng.shuffle(all_indices)
+
+        n_finetune = max(1, int(len(all_indices) * finetune_ratio))
+
+        if split == 'finetune':
+            self.indices = all_indices[:n_finetune]
+        else:
+            self.indices = all_indices[n_finetune:]
+
+        self.subject_dataset = subject_dataset
+
+        print(f"    SubjectDatasetSplit [{split}]: "
+              f"{len(self.indices)}/{len(all_indices)} samples "
+              f"({len(self.indices)/len(all_indices)*100:.1f}%)")
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        return self.subject_dataset[self.indices[i]]
 
 def make_loader(full_dataset: EEGDatasetFull, subject_ids, shuffle=True):
     """Creates a DataLoader filtered to the given subject IDs."""
@@ -257,6 +308,65 @@ def train_model(model, train_loader, val_loader, test_loader, epochs, tag=""):
 
     return model, best_val_acc, best_test_acc, best_epoch
 
+def finetune_model(model, finetune_loader, test_loader, epochs, lr,
+                   freeze_encoder=False, tag=""):
+    """
+    Fine-tuning stage: adapts a pre-trained model to the target subject.
+
+    If freeze_encoder=True, all parameters except the final classifier
+    layer are frozen, so only the head is updated. This is safer when the
+    fine-tuning set is very small.
+
+    If freeze_encoder=False, the full network is trained at the lower
+    fine-tuning LR, allowing the encoder to adapt as well.
+
+    Returns:
+        model          — fine-tuned model (weights at last epoch)
+        best_test_acc  — test accuracy at the epoch of best fine-tune loss
+        best_epoch     — epoch index of best fine-tune loss
+    """
+    if freeze_encoder:
+        # Freeze everything except the classifier head
+        for name, param in model.named_parameters():
+            param.requires_grad = (name.startswith("classifier"))
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        print(f"    [{tag}] Encoder frozen — training classifier head only "
+              f"({sum(p.numel() for p in trainable)} params)")
+    else:
+        for param in model.parameters():
+            param.requires_grad = True
+        print(f"    [{tag}] Full network fine-tuning at LR={lr}")
+
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+    )
+    # No LR scheduler for fine-tuning — keep it simple and stable
+    best_finetune_loss = float('inf')
+    best_test_acc      = 0.0
+    best_epoch         = 0
+
+    for epoch in range(1, epochs + 1):
+        ft_loss, ft_acc = run_epoch(model, finetune_loader, optimizer, train=True)
+        te_loss, te_acc = run_epoch(model, test_loader, train=False)
+
+        # Track best by fine-tune loss (not val acc, since fine-tune set IS target subject)
+        if ft_loss < best_finetune_loss:
+            best_finetune_loss = ft_loss
+            best_test_acc      = te_acc
+            best_epoch         = epoch
+
+        print(
+            f"    [{tag}] FT Epoch {epoch:03d}: "
+            f"FtL={ft_loss:.4f} FtA={ft_acc:.4f} | "
+            f"TeL={te_loss:.4f} TeA={te_acc:.4f} | "
+            f"Best TeA={best_test_acc:.4f} (ep {best_epoch})"
+        )
+
+    # Unfreeze all params before returning (in case model is reused)
+    for param in model.parameters():
+        param.requires_grad = True
+
+    return model, best_test_acc, best_epoch
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 2 helpers
@@ -281,6 +391,7 @@ def extract_subject_centroids(model, full_dataset: EEGDatasetFull, num_subjects=
     """
     model.eval()
     centroids = {}
+    all_embeddings = {}
 
     for subject_id in range(1, num_subjects + 1):
         try:
@@ -299,37 +410,118 @@ def extract_subject_centroids(model, full_dataset: EEGDatasetFull, num_subjects=
         centroid = all_emb.mean(dim=0)              # (d_model,)
         centroids[subject_id] = centroid
 
+        all_embeddings[subject_id] = all_emb
+
         print(f"  Subject {subject_id}: {all_emb.shape[0]} samples  |  "
               f"centroid ‖·‖={centroid.norm().item():.4f}")
 
-    return centroids
+    return centroids, all_embeddings
 
-
-def compute_distance_matrix(centroids: dict):
+def compute_pooled_covariance(centroids: dict, all_embeddings: dict, regularisation: float=1e-5):
     """
-    Phase 2 — Distance Matrix Calculation.
+    Computes the pooled within-subject covariance matrix over the embedding
+    space.  For each subject the per-sample deviations from that subject's
+    centroid are accumulated; the result is then divided by the total degrees
+    of freedom (total samples minus number of subjects).
 
-    Computes pairwise Euclidean distances between all Subject Centroids and
-    prints the resulting N×N matrix.
+    This gives the Mahalanobis distance its key advantage: distances between
+    centroids are scaled by the natural within-subject variability in each
+    direction of embedding space.  Dimensions along which subjects vary a
+    lot internally are down-weighted; tight, consistent dimensions count more.
+
+    A small regularisation term (epsilon * I) is added to the diagonal to
+    ensure the matrix is invertible even if some embedding dimensions are
+    nearly constant.
+
+    Args:
+    centroids       : dict {subject_id: centroid tensor (d_model,)}
+    all_embeddings  : dict {subject_id: tensor (N_subject, d_model)}
+    regularisation  : epsilon added to the diagonal for numerical stability
 
     Returns:
-        dist_matrix  : np.ndarray of shape (N, N)
-        subject_ids  : sorted list of subject IDs (row/col index mapping)
+    cov_inv : torch.Tensor (d_model, d_model) — inverse of the pooled
+             covariance matrix, ready for Mahalanobis computation
+    """
+    d_model = next(iter(centroids.values())).shape[0]
+    scatter_sum = torch.zeros(d_model, d_model)
+    total_df = 0        # total degrees of freedom
+
+    for subjects_id, emb in all_embeddings.items():
+        centroid = centroids[subjects_id].unsqueeze(0)      # (1, d_model)
+        deviations = emb - centroid                         # (N, d_model)
+        scatter_sum += deviations.T @ deviations            # (d_model, d_model)
+        total_df    += emb.shape[0]-1                       # N - 1 per subject
+
+    pooled_cov = scatter_sum / total_df                     # (d_model, d_model)
+
+    # Regularise and invert
+    # pooled_cov += regularisation * torch.eye(d_model)
+    # cov_inv     = torch.linalg.inv(pooled_cov)
+
+    # Symmetrise to cancel any floating-point asymmetry from linalg.inv
+    # cov_inv = (cov_inv + cov_inv.T)/2.0
+
+    #Sanity diagnostics
+    eigenvalues = torch.linalg.eigvalsh(pooled_cov)
+    print(f"  Pooled covariance — min eigenvalue : {eigenvalues.min().item():.6f}")
+    print(f"  Pooled covariance — max eigenvalue : {eigenvalues.max().item():.6f}")
+
+    eps = torch.tensor(1e-12, device=eigenvalues.device)
+    min_eig = torch.maximum(eigenvalues.min(), eps)
+
+    print(f"  Condition number                   : "
+          f"{(eigenvalues.max() / min_eig).item():.2f}")
+    # print(f"  Condition number                   : "
+    #       f"{(eigenvalues.max() / eigenvalues.max(eigenvalues.min(), torch.tensor(1e-12))).item():.2f}")
+
+    # ── THE FIX ────────────────────────────────────────────────────────────
+    # Use Pseudo-Inverse (pinv) instead of adding diagonal regularisation.
+    # rcond=1e-5 tells it to safely ignore any eigenvalues smaller than
+    # (1e-5 * max_eigenvalue), preventing noise from blowing up.
+    cov_inv = torch.linalg.pinv(pooled_cov, rcond=regularisation, hermitian=True)
+    # ───────────────────────────────────────────────────────────────────────
+
+    # Symmetrise to cancel any floating-point asymmetry
+    cov_inv = (cov_inv + cov_inv.T) / 2.0
+
+    return cov_inv
+
+
+def compute_distance_matrix(centroids: dict, cov_inv: torch.Tensor = None):
+    """
+    Computes pairwise distances between all Subject Centroids.
+
+    If cov_inv is provided, uses Mahalanobis distance:
+        d_M(i,j) = sqrt( (μi - μj)^T  Σ^-1  (μi - μj) )
+
+    If cov_inv is None, falls back to Euclidean distance (original behaviour).
+
+    Returns:
+        dist_matrix : np.ndarray (N, N)
+        subject_ids : sorted list of subject IDs
     """
     subject_ids = sorted(centroids.keys())
-    n = len(subject_ids)
+    n           = len(subject_ids)
     dist_matrix = np.zeros((n, n), dtype=np.float32)
+    # dist_matrix = np.zeros((n, n), dtype=np.float32)
 
     for i, si in enumerate(subject_ids):
         for j, sj in enumerate(subject_ids):
             if i != j:
                 diff = centroids[si] - centroids[sj]
-                dist_matrix[i, j] = diff.norm().item()
+                if cov_inv is not None:
+                    # Mahalanobis: sqrt(diff^T * Σ^-1 * diff)
+                    dist_matrix[i, j] = torch.sqrt(
+                        diff @ cov_inv @ diff
+                    ).item()
+                else:
+                    # Euclidean fallback
+                    dist_matrix[i, j] = diff.norm().item()
 
-    # Pretty-print the matrix
-    col_header = "       " + "   ".join(f"S{s:d}" for s in subject_ids)
+    metric = "Mahalanobis" if cov_inv is not None else "Euclidean"
+    col_header = f"  [{metric}]\n       " + "   ".join(f"S{s:d}" for s in subject_ids)
     print(col_header)
-    print("     " + "─" * (len(col_header) - 5))
+    print("     " + "─" * (len(col_header) - 14))
     for i, si in enumerate(subject_ids):
         row = f"S{si:d} │  " + "  ".join(f"{dist_matrix[i, j]:5.3f}" for j in range(n))
         print(row)
@@ -398,20 +590,36 @@ def main():
 
     if opt.baseline_model:
         print(f"  Loading pre-trained baseline: {opt.baseline_model}")
-        baseline_model = torch.load(opt.baseline_model, weights_only=False).to(device)
+        baseline_model = torch.load(opt.baseline_model, map_location=device, weights_only=False)
     else:
-        print("  Training baseline on all subjects …")
-        print("  Split: subjects 1–4 → train | subject 5 → val | subject 6 → test")
-        print("  (Edit this block to use your pre-computed LOSO splits instead.)\n")
+        print("  Training baseline on all subjects (Multi-Subject) …")
+        print("  Split: 80% Train | 10% Val | 10% Test across the entire dataset\n")
 
         baseline_model = build_model()
 
-        # Default split: first four subjects train, fifth val, sixth test.
-        # Replace make_loader calls below with your preferred split strategy,
-        # e.g. load a LOSO .pth split file as in the original training script.
-        baseline_train = make_loader(full_dataset, all_subjects[:4], shuffle=True)
-        baseline_val   = make_loader(full_dataset, [all_subjects[4]], shuffle=False)
-        baseline_test  = make_loader(full_dataset, [all_subjects[5]], shuffle=False)
+        all_subjects_ds = SubjectDataset(full_dataset, all_subjects)
+
+        # Calculate 80/10/10 global split sizes
+        total_len = len(all_subjects_ds)
+        train_len = int(0.8 * total_len)
+        val_len = int(0.1 * total_len)
+        test_len = total_len - train_len - val_len
+
+        # Randomly split the pooled dataset
+        train_ds, val_ds, test_ds = torch.utils.data.random_split(
+            all_subjects_ds,
+            [train_len, val_len, test_len],
+            generator=torch.Generator().manual_seed(opt.seed)
+        )
+
+        # Generate DataLoaders (using standard PyTorch utilities instead of make_loader)
+        baseline_train = DataLoader(train_ds, batch_size=opt.batch_size, drop_last=True, shuffle=True,
+                                    pin_memory=USE_CUDA)
+        baseline_val = DataLoader(val_ds, batch_size=opt.batch_size, drop_last=False, shuffle=False,
+                                  pin_memory=USE_CUDA)
+        baseline_test = DataLoader(test_ds, batch_size=opt.batch_size, drop_last=False, shuffle=False,
+                                   pin_memory=USE_CUDA)
+
 
         baseline_model, bv, bt, be = train_model(
             baseline_model,
@@ -433,10 +641,16 @@ def main():
     print("─" * 70)
 
     print("\n  Extracting subject centroids from frozen baseline …")
-    centroids = extract_subject_centroids(baseline_model, full_dataset, opt.num_subjects)
 
-    print("\n  Pairwise Euclidean distance matrix:")
-    dist_matrix, subject_ids = compute_distance_matrix(centroids)
+    centroids, all_embeddings = extract_subject_centroids(
+        baseline_model, full_dataset, opt.num_subjects
+    )
+
+    print("\n  Computing pooled within-subject covariance ...")
+    cov_inv = compute_pooled_covariance(centroids, all_embeddings)
+
+    print("\n  Pairwise Mahalanobis distance matrix:")
+    dist_matrix, subject_ids = compute_distance_matrix(centroids, cov_inv)
 
     np.save("subject_distance_matrix.npy", dist_matrix)
     print("\n  Distance matrix saved → subject_distance_matrix.npy")
@@ -455,38 +669,66 @@ def main():
             target_subject, dist_matrix, subject_ids,
             n_train=opt.n_train, n_val=opt.n_val,
         )
+        # ── Stage A: build data loaders ───────────────────────────────────
+        train_loader = make_loader(full_dataset, train_subs, shuffle=True)
+        val_loader = make_loader(full_dataset, val_subs, shuffle=False)
 
-        print(f"\n  ── Target: Subject {target_subject} ──────────────────────────")
-        print(f"     Train subjects : {train_subs}")
-        print(f"     Val   subjects : {val_subs}")
-        print(f"     Test  subject  : [{target_subject}]")
+        # Split target subject into fine-tune portion and held-out test portion
+        target_subject_ds = SubjectDataset(full_dataset, [target_subject])
+        finetune_ds = SubjectDatasetSplit(target_subject_ds,
+                                          finetune_ratio=opt.finetune_ratio,
+                                          split='finetune',
+                                          seed=opt.seed)
+        test_ds = SubjectDatasetSplit(target_subject_ds,
+                                      finetune_ratio=opt.finetune_ratio,
+                                      split='test',
+                                      seed=opt.seed)
 
-        # Compute distances for display
-        ti = subject_ids.index(target_subject)
-        for s in train_subs + val_subs:
-            si = subject_ids.index(s)
-            print(f"       dist(S{target_subject}, S{s}) = "
-                  f"{dist_matrix[ti, si]:.4f}")
+        finetune_loader = DataLoader(finetune_ds, batch_size=opt.batch_size,
+                                     drop_last=False, shuffle=True,
+                                     num_workers=0, pin_memory=USE_CUDA)
+        test_loader = DataLoader(test_ds, batch_size=opt.batch_size,
+                                 drop_last=False, shuffle=False,
+                                 num_workers=0, pin_memory=USE_CUDA)
 
-        train_loader = make_loader(full_dataset, train_subs,       shuffle=True)
-        val_loader   = make_loader(full_dataset, val_subs,         shuffle=False)
-        test_loader  = make_loader(full_dataset, [target_subject], shuffle=False)
+        # ── Stage B: pre-train on similar subjects ────────────────────────
+        print(f"\n     [Stage B] Pre-training on subjects {train_subs} "
+              f"(val: {val_subs}) for {opt.targeted_epochs} epochs …")
+        targeted_model = build_model()
 
-        targeted_model = build_model()   # fresh weights every time
-
-        _, best_val, best_test, best_ep = train_model(
+        _, pretrain_val, pretrain_test, pretrain_ep = train_model(
             targeted_model,
             train_loader, val_loader, test_loader,
             epochs=opt.targeted_epochs,
-            tag=f"Target-S{target_subject}",
+            tag=f"PreTrain-S{target_subject}",
         )
+        print(f"     [Stage B] Done — VA={pretrain_val:.4f}  "
+              f"TeA@maxVA={pretrain_test:.4f}  (ep {pretrain_ep})")
 
+        # ── Stage C: fine-tune on target subject ──────────────────────────
+        print(f"\n     [Stage C] Fine-tuning on Subject {target_subject} "
+              f"({opt.finetune_ratio * 100:.0f}% of data, "
+              f"{opt.finetune_epochs} epochs, "
+              f"freeze_encoder={opt.freeze_encoder}) …")
+        _, finetune_test, finetune_ep = finetune_model(
+            targeted_model,
+            finetune_loader, test_loader,
+            epochs=opt.finetune_epochs,
+            lr=opt.finetune_lr,
+            freeze_encoder=opt.freeze_encoder,
+            tag=f"FineTune-S{target_subject}",
+        )
+        print(f"     [Stage C] Done — Best TeA={finetune_test:.4f}  (ep {finetune_ep})")
+
+        # ── Record both stages for comparison ─────────────────────────────
         results[target_subject] = {
-            "train_subjects" : train_subs,
-            "val_subjects"   : val_subs,
-            "best_val_acc"   : best_val,
-            "best_test_acc"  : best_test,
-            "best_epoch"     : best_ep,
+            "train_subjects": train_subs,
+            "val_subjects": val_subs,
+            "pretrain_val_acc": pretrain_val,
+            "pretrain_test_acc": pretrain_test,  # TeA@maxVA without fine-tuning
+            "pretrain_best_epoch": pretrain_ep,
+            "finetune_test_acc": finetune_test,  # TeA after fine-tuning
+            "finetune_best_epoch": finetune_ep,
         }
 
         model_path = f"targeted_model_subject{target_subject}.pth"
@@ -504,9 +746,10 @@ def main():
         print(
             f"  Subject {subj} "
             f"[train={res['train_subjects']}, val={res['val_subjects']}]  "
-            f"TeA@maxVA = {res['best_test_acc']:.4f}  (ep {res['best_epoch']})"
+            f"PreTrain TeA@maxVA={res['pretrain_test_acc']:.4f}  →  "
+            f"FineTune TeA={res['finetune_test_acc']:.4f}"
         )
-        mean_acc += res['best_test_acc']
+        mean_acc += res['finetune_test_acc']
 
     print(f"\n  Mean TeA@maxVA (all subjects): {mean_acc / len(results):.4f}")
     print("=" * 70)
